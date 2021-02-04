@@ -151,7 +151,7 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
     // Check: topTopicAssignments
     // Make sure it assigns a topic to each term appearing in each doc.
     val topTopicAssignments: Map[Long, (Array[Int], Array[Int])] =
-      model.topicAssignments.collect().map(x => x._1 -> (x._2, x._3)).toMap
+      model.topicAssignments.collect().map(x => x._1 -> ((x._2, x._3))).toMap
     assert(topTopicAssignments.keys.max < tinyCorpus.length)
     tinyCorpus.foreach { case (docID: Long, doc: Vector) =>
       if (topTopicAssignments.contains(docID)) {
@@ -278,10 +278,10 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
   test("LocalLDAModel logLikelihood") {
     val ldaModel: LocalLDAModel = toyModel
 
-    val docsSingleWord = sc.parallelize(Array(Vectors.sparse(6, Array(0), Array(1)))
+    val docsSingleWord = sc.parallelize(Seq(Vectors.sparse(6, Array(0), Array(1)))
       .zipWithIndex
       .map { case (wordCounts, docId) => (docId.toLong, wordCounts) })
-    val docsRepeatedWord = sc.parallelize(Array(Vectors.sparse(6, Array(0), Array(5)))
+    val docsRepeatedWord = sc.parallelize(Seq(Vectors.sparse(6, Array(0), Array(5)))
       .zipWithIndex
       .map { case (wordCounts, docId) => (docId.toLong, wordCounts) })
 
@@ -505,6 +505,8 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       assert(distributedModel.topicConcentration === sameDistributedModel.topicConcentration)
       assert(distributedModel.gammaShape === sameDistributedModel.gammaShape)
       assert(distributedModel.globalTopicTotals === sameDistributedModel.globalTopicTotals)
+      assert(distributedModel.logLikelihood ~== sameDistributedModel.logLikelihood absTol 1e-6)
+      assert(distributedModel.logPrior ~== sameDistributedModel.logPrior absTol 1e-6)
 
       val graph = distributedModel.graph
       val sameGraph = sameDistributedModel.graph

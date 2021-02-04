@@ -47,6 +47,24 @@ sealed trait IdentifierWithDatabase {
   override def toString: String = quotedString
 }
 
+/**
+ * Encapsulates an identifier that is either a alias name or an identifier that has table
+ * name and a qualifier.
+ * The SubqueryAlias node keeps track of the qualifier using the information in this structure
+ * @param name - Is an alias name or a table name
+ * @param qualifier - Is a qualifier
+ */
+case class AliasIdentifier(name: String, qualifier: Seq[String]) {
+  import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+
+  def this(identifier: String) = this(identifier, Seq())
+
+  override def toString: String = (qualifier :+ name).quoted
+}
+
+object AliasIdentifier {
+  def apply(name: String): AliasIdentifier = new AliasIdentifier(name)
+}
 
 /**
  * Identifies a table in a database.
@@ -60,7 +78,11 @@ case class TableIdentifier(table: String, database: Option[String])
   override val identifier: String = table
 
   def this(table: String) = this(table, None)
+}
 
+/** A fully qualified identifier for a table (i.e., database.tableName) */
+case class QualifiedTableName(database: String, name: String) {
+  override def toString: String = s"$database.$name"
 }
 
 object TableIdentifier {

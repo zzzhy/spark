@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.expressions
 import java.lang.reflect.{Method, Modifier}
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TypeCheckResult}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.types._
@@ -45,17 +45,19 @@ import org.apache.spark.util.Utils
  */
 @ExpressionDescription(
   usage = "_FUNC_(class, method[, arg1[, arg2 ..]]) - Calls a method with reflection.",
-  extended = """
+  examples = """
     Examples:
       > SELECT _FUNC_('java.util.UUID', 'randomUUID');
        c33fb387-8500-4bfa-81d2-6e0e3e930df2
       > SELECT _FUNC_('java.util.UUID', 'fromString', 'a5cf6c42-0c85-418f-af6c-3e4e5b1328f2');
        a5cf6c42-0c85-418f-af6c-3e4e5b1328f2
-  """)
+  """,
+  since = "2.0.0",
+  group = "misc_funcs")
 case class CallMethodViaReflection(children: Seq[Expression])
-  extends Expression with CodegenFallback {
+  extends Nondeterministic with CodegenFallback {
 
-  override def prettyName: String = "reflect"
+  override def prettyName: String = getTagValue(FunctionRegistry.FUNC_ALIAS).getOrElse("reflect")
 
   override def checkInputDataTypes(): TypeCheckResult = {
     if (children.size < 2) {
@@ -65,6 +67,10 @@ case class CallMethodViaReflection(children: Seq[Expression])
       TypeCheckFailure("first two arguments should be string literals")
     } else if (!classExists) {
       TypeCheckFailure(s"class $className not found")
+    } else if (children.slice(2, children.length)
+        .exists(e => !CallMethodViaReflection.typeMapping.contains(e.dataType))) {
+      TypeCheckFailure("arguments from the third require boolean, byte, short, " +
+        "integer, long, float, double or string expressions")
     } else if (method == null) {
       TypeCheckFailure(s"cannot find a static method that matches the argument types in $className")
     } else {
@@ -72,11 +78,11 @@ case class CallMethodViaReflection(children: Seq[Expression])
     }
   }
 
-  override def deterministic: Boolean = false
   override def nullable: Boolean = true
   override val dataType: DataType = StringType
+  override protected def initializeInternal(partitionIndex: Int): Unit = {}
 
-  override def eval(input: InternalRow): Any = {
+  override protected def evalInternal(input: InternalRow): Any = {
     var i = 0
     while (i < argExprs.length) {
       buffer(i) = argExprs(i).eval(input).asInstanceOf[Object]

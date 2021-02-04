@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.hive
 
+import java.lang.reflect.{ParameterizedType, Type, WildcardType}
+
 import scala.collection.JavaConverters._
 
 import org.apache.hadoop.{io => hadoopIo}
@@ -30,6 +32,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.execution.datasources.DaysWritable
 import org.apache.spark.sql.types
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -51,8 +54,8 @@ import org.apache.spark.unsafe.types.UTF8String
  *     java.sql.Date
  *     java.sql.Timestamp
  *  Complex Types =>
- *    Map: [[MapData]]
- *    List: [[ArrayData]]
+ *    Map: `MapData`
+ *    List: `ArrayData`
  *    Struct: [[org.apache.spark.sql.catalyst.InternalRow]]
  *    Union: NOT SUPPORTED YET
  *  The Complex types plays as a container, which can hold arbitrary data types.
@@ -178,7 +181,7 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 private[hive] trait HiveInspectors {
 
-  def javaClassToDataType(clz: Class[_]): DataType = clz match {
+  def javaTypeToDataType(clz: Type): DataType = clz match {
     // writable
     case c: Class[_] if c == classOf[hadoopIo.DoubleWritable] => DoubleType
     case c: Class[_] if c == classOf[hiveIo.DoubleWritable] => DoubleType
@@ -218,24 +221,40 @@ private[hive] trait HiveInspectors {
     case c: Class[_] if c == java.lang.Float.TYPE => FloatType
     case c: Class[_] if c == java.lang.Boolean.TYPE => BooleanType
 
-    case c: Class[_] if c.isArray => ArrayType(javaClassToDataType(c.getComponentType))
+    case c: Class[_] if c.isArray => ArrayType(javaTypeToDataType(c.getComponentType))
 
     // Hive seems to return this for struct types?
     case c: Class[_] if c == classOf[java.lang.Object] => NullType
 
-    // java list type unsupported
-    case c: Class[_] if c == classOf[java.util.List[_]] =>
-      throw new AnalysisException(
-        "List type in java is unsupported because " +
-        "JVM type erasure makes spark fail to catch a component type in List<>")
+    case p: ParameterizedType if isSubClassOf(p.getRawType, classOf[java.util.List[_]]) =>
+      val Array(elementType) = p.getActualTypeArguments
+      ArrayType(javaTypeToDataType(elementType))
 
-    // java map type unsupported
-    case c: Class[_] if c == classOf[java.util.Map[_, _]] =>
+    case p: ParameterizedType if isSubClassOf(p.getRawType, classOf[java.util.Map[_, _]]) =>
+      val Array(keyType, valueType) = p.getActualTypeArguments
+      MapType(javaTypeToDataType(keyType), javaTypeToDataType(valueType))
+
+    // raw java list type unsupported
+    case c: Class[_] if isSubClassOf(c, classOf[java.util.List[_]]) =>
       throw new AnalysisException(
-        "Map type in java is unsupported because " +
-        "JVM type erasure makes spark fail to catch key and value types in Map<>")
+        "Raw list type in java is unsupported because Spark cannot infer the element type.")
+
+    // raw java map type unsupported
+    case c: Class[_] if isSubClassOf(c, classOf[java.util.Map[_, _]]) =>
+      throw new AnalysisException(
+        "Raw map type in java is unsupported because Spark cannot infer key and value types.")
+
+    case _: WildcardType =>
+      throw new AnalysisException(
+        "Collection types with wildcards (e.g. List<?> or Map<?, ?>) are unsupported because " +
+          "Spark cannot infer the data type for these type parameters.")
 
     case c => throw new AnalysisException(s"Unsupported java type $c")
+  }
+
+  private def isSubClassOf(t: Type, parent: Class[_]): Boolean = t match {
+    case cls: Class[_] => parent.isAssignableFrom(cls)
+    case _ => false
   }
 
   private def withNullSafe(f: Any => Any): Any => Any = {
@@ -286,12 +305,17 @@ private[hive] trait HiveInspectors {
         withNullSafe(o => getByteWritable(o))
       case _: ByteObjectInspector =>
         withNullSafe(o => o.asInstanceOf[java.lang.Byte])
-      case _: JavaHiveVarcharObjectInspector =>
+        // To spark HiveVarchar and HiveChar are same as string
+      case _: HiveVarcharObjectInspector if x.preferWritable() =>
+        withNullSafe(o => getStringWritable(o))
+      case _: HiveVarcharObjectInspector =>
         withNullSafe { o =>
             val s = o.asInstanceOf[UTF8String].toString
             new HiveVarchar(s, s.length)
         }
-      case _: JavaHiveCharObjectInspector =>
+      case _: HiveCharObjectInspector if x.preferWritable() =>
+        withNullSafe(o => getStringWritable(o))
+      case _: HiveCharObjectInspector =>
         withNullSafe { o =>
             val s = o.asInstanceOf[UTF8String].toString
             new HiveChar(s, s.length)
@@ -442,7 +466,7 @@ private[hive] trait HiveInspectors {
         _ => constant
       case poi: WritableConstantTimestampObjectInspector =>
         val t = poi.getWritableConstantValue
-        val constant = t.getSeconds * 1000000L + t.getNanos / 1000L
+        val constant = DateTimeUtils.fromJavaTimestamp(t.getTimestamp)
         _ => constant
       case poi: WritableConstantIntObjectInspector =>
         val constant = poi.getWritableConstantValue.get()
@@ -594,7 +618,7 @@ private[hive] trait HiveInspectors {
         case x: DateObjectInspector if x.preferWritable() =>
           data: Any => {
             if (data != null) {
-              DateTimeUtils.fromJavaDate(x.getPrimitiveWritableObject(data).get())
+              new DaysWritable(x.getPrimitiveWritableObject(data)).gregorianDays
             } else {
               null
             }
@@ -610,8 +634,7 @@ private[hive] trait HiveInspectors {
         case x: TimestampObjectInspector if x.preferWritable() =>
           data: Any => {
             if (data != null) {
-              val t = x.getPrimitiveWritableObject(data)
-              t.getSeconds * 1000000L + t.getNanos / 1000L
+              DateTimeUtils.fromJavaTimestamp(x.getPrimitiveWritableObject(data).getTimestamp)
             } else {
               null
             }
@@ -671,7 +694,7 @@ private[hive] trait HiveInspectors {
         }
         data: Any => {
           if (data != null) {
-            InternalRow.fromSeq(unwrappers.map(_(data)))
+            InternalRow.fromSeq(unwrappers.map(_(data)).toSeq)
           } else {
             null
           }
@@ -768,11 +791,14 @@ private[hive] trait HiveInspectors {
       ObjectInspectorFactory.getStandardStructObjectInspector(
         java.util.Arrays.asList(fields.map(f => f.name) : _*),
         java.util.Arrays.asList(fields.map(f => toInspector(f.dataType)) : _*))
+    case _: UserDefinedType[_] =>
+      val sqlType = dataType.asInstanceOf[UserDefinedType[_]].sqlType
+      toInspector(sqlType)
   }
 
   /**
    * Map the catalyst expression to ObjectInspector, however,
-   * if the expression is [[Literal]] or foldable, a constant writable object inspector returns;
+   * if the expression is `Literal` or foldable, a constant writable object inspector returns;
    * Otherwise, we always get the object inspector according to its data type(in catalyst)
    * @param expr Catalyst expression to be mapped
    * @return Hive java objectinspector (recursively).
@@ -828,6 +854,10 @@ private[hive] trait HiveInspectors {
 
         ObjectInspectorFactory.getStandardConstantMapObjectInspector(keyOI, valueOI, jmap)
       }
+    case Literal(_, dt: StructType) =>
+      toInspector(dt)
+    case Literal(_, dt: UserDefinedType[_]) =>
+      toInspector(dt.sqlType)
     // We will enumerate all of the possible constant expressions, throw exception if we missed
     case Literal(_, dt) => sys.error(s"Hive doesn't support the constant type [$dt].")
     // ideally, we don't test the foldable here(but in optimizer), however, some of the
@@ -842,7 +872,7 @@ private[hive] trait HiveInspectors {
       StructType(s.getAllStructFieldRefs.asScala.map(f =>
         types.StructField(
           f.getFieldName, inspectorToDataType(f.getFieldObjectInspector), nullable = true)
-      ))
+      ).toSeq)
     case l: ListObjectInspector => ArrayType(inspectorToDataType(l.getListElementObjectInspector))
     case m: MapObjectInspector =>
       MapType(
@@ -980,8 +1010,12 @@ private[hive] trait HiveInspectors {
       new hadoopIo.BytesWritable(value.asInstanceOf[Array[Byte]])
     }
 
-  private def getDateWritable(value: Any): hiveIo.DateWritable =
-    if (value == null) null else new hiveIo.DateWritable(value.asInstanceOf[Int])
+  private def getDateWritable(value: Any): DaysWritable =
+    if (value == null) {
+      null
+    } else {
+      new DaysWritable(value.asInstanceOf[Int])
+    }
 
   private def getTimestampWritable(value: Any): hiveIo.TimestampWritable =
     if (value == null) {
@@ -1005,6 +1039,7 @@ private[hive] trait HiveInspectors {
 
     private def decimalTypeInfo(decimalType: DecimalType): TypeInfo = decimalType match {
       case DecimalType.Fixed(precision, scale) => new DecimalTypeInfo(precision, scale)
+      case dt => throw new AnalysisException(s"${dt.catalogString} is not supported.")
     }
 
     def toTypeInfo: TypeInfo = dt match {
@@ -1012,8 +1047,8 @@ private[hive] trait HiveInspectors {
         getListTypeInfo(elemType.toTypeInfo)
       case StructType(fields) =>
         getStructTypeInfo(
-          java.util.Arrays.asList(fields.map(_.name) : _*),
-          java.util.Arrays.asList(fields.map(_.dataType.toTypeInfo) : _*))
+          java.util.Arrays.asList(fields.map(_.name): _*),
+          java.util.Arrays.asList(fields.map(_.dataType.toTypeInfo): _*))
       case MapType(keyType, valueType, _) =>
         getMapTypeInfo(keyType.toTypeInfo, valueType.toTypeInfo)
       case BinaryType => binaryTypeInfo
@@ -1029,6 +1064,9 @@ private[hive] trait HiveInspectors {
       case DateType => dateTypeInfo
       case TimestampType => timestampTypeInfo
       case NullType => voidTypeInfo
+      case dt =>
+        throw new AnalysisException(
+          s"${dt.catalogString} cannot be converted to Hive TypeInfo")
     }
   }
 }

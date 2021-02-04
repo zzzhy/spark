@@ -16,22 +16,15 @@
  */
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.SimpleCatalystConf
-import org.apache.spark.sql.catalyst.analysis.{Analyzer, EmptyFunctionRegistry}
-import org.apache.spark.sql.catalyst.catalog.{InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.expressions.{If, Literal}
-import org.apache.spark.sql.catalyst.expressions.aggregate.{CollectSet, Count}
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.expressions.aggregate.CollectSet
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Expand, LocalRelation, LogicalPlan}
 import org.apache.spark.sql.types.{IntegerType, StringType}
 
 class RewriteDistinctAggregatesSuite extends PlanTest {
-  val conf = SimpleCatalystConf(caseSensitiveAnalysis = false, groupByOrdinal = false)
-  val catalog = new SessionCatalog(new InMemoryCatalog, EmptyFunctionRegistry, conf)
-  val analyzer = new Analyzer(catalog, conf)
-
   val nullInt = Literal(null, IntegerType)
   val nullString = Literal(null, StringType)
   val testRelation = LocalRelation('a.string, 'b.string, 'c.string, 'd.string, 'e.int)
@@ -57,15 +50,6 @@ class RewriteDistinctAggregatesSuite extends PlanTest {
       .analyze
     val rewrite = RewriteDistinctAggregates(input)
     comparePlans(input, rewrite)
-  }
-
-  test("single distinct group with non-partial aggregates") {
-    val input = testRelation
-      .groupBy('a, 'd)(
-        countDistinct('e, 'c).as('agg1),
-        CollectSet('b).toAggregateExpression().as('agg2))
-      .analyze
-    checkRewrite(RewriteDistinctAggregates(input))
   }
 
   test("multiple distinct groups") {

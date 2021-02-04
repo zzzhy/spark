@@ -17,31 +17,40 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.SparkContext
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
 
-class SparkPlanner(
-    val sparkContext: SparkContext,
-    val conf: SQLConf,
-    val extraStrategies: Seq[Strategy])
-  extends SparkStrategies {
+class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
+  extends SparkStrategies with SQLConfHelper {
 
   def numPartitions: Int = conf.numShufflePartitions
 
-  def strategies: Seq[Strategy] =
-      extraStrategies ++ (
+  override def strategies: Seq[Strategy] =
+    experimentalMethods.extraStrategies ++
+      extraPlanningStrategies ++ (
+      LogicalQueryStageStrategy ::
+      PythonEvals ::
+      new DataSourceV2Strategy(session) ::
       FileSourceStrategy ::
       DataSourceStrategy ::
-      DDLStrategy ::
       SpecialLimits ::
       Aggregation ::
+      Window ::
       JoinSelection ::
       InMemoryScans ::
+      SparkScripts ::
       BasicOperators :: Nil)
+
+  /**
+   * Override to add extra planning strategies to the planner. These strategies are tried after
+   * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
+   */
+  def extraPlanningStrategies: Seq[Strategy] = Nil
 
   override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
     plan.collect {

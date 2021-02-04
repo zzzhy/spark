@@ -19,8 +19,6 @@ package org.apache.spark.metrics.source
 
 import com.codahale.metrics.MetricRegistry
 
-import org.apache.spark.annotation.Experimental
-
 private[spark] object StaticSources {
   /**
    * The set of all static sources. These sources may be reported to from any class, including
@@ -30,10 +28,8 @@ private[spark] object StaticSources {
 }
 
 /**
- * :: Experimental ::
  * Metrics for code generation.
  */
-@Experimental
 object CodegenMetrics extends Source {
   override val sourceName: String = "CodeGenerator"
   override val metricRegistry: MetricRegistry = new MetricRegistry()
@@ -62,10 +58,8 @@ object CodegenMetrics extends Source {
 }
 
 /**
- * :: Experimental ::
  * Metrics for access to the hive external catalog.
  */
-@Experimental
 object HiveCatalogMetrics extends Source {
   override val sourceName: String = "HiveExternalCatalog"
   override val metricRegistry: MetricRegistry = new MetricRegistry()
@@ -86,16 +80,31 @@ object HiveCatalogMetrics extends Source {
   val METRIC_FILE_CACHE_HITS = metricRegistry.counter(MetricRegistry.name("fileCacheHits"))
 
   /**
+   * Tracks the total number of Hive client calls (e.g. to lookup a table).
+   */
+  val METRIC_HIVE_CLIENT_CALLS = metricRegistry.counter(MetricRegistry.name("hiveClientCalls"))
+
+  /**
+   * Tracks the total number of Spark jobs launched for parallel file listing.
+   */
+  val METRIC_PARALLEL_LISTING_JOB_COUNT = metricRegistry.counter(
+    MetricRegistry.name("parallelListingJobCount"))
+
+  /**
    * Resets the values of all metrics to zero. This is useful in tests.
    */
   def reset(): Unit = {
     METRIC_PARTITIONS_FETCHED.dec(METRIC_PARTITIONS_FETCHED.getCount())
     METRIC_FILES_DISCOVERED.dec(METRIC_FILES_DISCOVERED.getCount())
     METRIC_FILE_CACHE_HITS.dec(METRIC_FILE_CACHE_HITS.getCount())
+    METRIC_HIVE_CLIENT_CALLS.dec(METRIC_HIVE_CLIENT_CALLS.getCount())
+    METRIC_PARALLEL_LISTING_JOB_COUNT.dec(METRIC_PARALLEL_LISTING_JOB_COUNT.getCount())
   }
 
   // clients can use these to avoid classloader issues with the codahale classes
   def incrementFetchedPartitions(n: Int): Unit = METRIC_PARTITIONS_FETCHED.inc(n)
   def incrementFilesDiscovered(n: Int): Unit = METRIC_FILES_DISCOVERED.inc(n)
   def incrementFileCacheHits(n: Int): Unit = METRIC_FILE_CACHE_HITS.inc(n)
+  def incrementHiveClientCalls(n: Int): Unit = METRIC_HIVE_CLIENT_CALLS.inc(n)
+  def incrementParallelListingJobCount(n: Int): Unit = METRIC_PARALLEL_LISTING_JOB_COUNT.inc(n)
 }

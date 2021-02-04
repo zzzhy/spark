@@ -16,11 +16,9 @@
  */
 package org.apache.spark.examples.sql
 
-// $example on:schema_inferring$
-import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.Encoder
-// $example off:schema_inferring$
+// $example on:programmatic_schema$
 import org.apache.spark.sql.Row
+// $example off:programmatic_schema$
 // $example on:init_session$
 import org.apache.spark.sql.SparkSession
 // $example off:init_session$
@@ -33,12 +31,10 @@ import org.apache.spark.sql.types._
 object SparkSQLExample {
 
   // $example on:create_ds$
-  // Note: Case classes in Scala 2.10 can support only up to 22 fields. To work around this limit,
-  // you can use custom classes that implement the Product interface
   case class Person(name: String, age: Long)
   // $example off:create_ds$
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     // $example on:init_session$
     val spark = SparkSession
       .builder()
@@ -46,8 +42,6 @@ object SparkSQLExample {
       .config("spark.some.config.option", "some-value")
       .getOrCreate()
 
-    // For implicit conversions like converting RDDs to DataFrames
-    import spark.implicits._
     // $example off:init_session$
 
     runBasicDataFrameExample(spark)

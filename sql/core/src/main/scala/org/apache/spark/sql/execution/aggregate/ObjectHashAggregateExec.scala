@@ -17,15 +17,16 @@
 
 package org.apache.spark.sql.execution.aggregate
 
+import java.util.concurrent.TimeUnit._
+
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.errors._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.util.Utils
 
 /**
  * A hash-based aggregate operator that supports [[TypedImperativeAggregate]] functions that may
@@ -65,48 +66,38 @@ case class ObjectHashAggregateExec(
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan)
-  extends UnaryExecNode {
-
-  private[this] val aggregateBufferAttributes = {
-    aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
-  }
+  extends BaseAggregateExec {
 
   override lazy val allAttributes: AttributeSeq =
     child.output ++ aggregateBufferAttributes ++ aggregateAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
 
   override lazy val metrics = Map(
-    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows")
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
+    "aggTime" -> SQLMetrics.createTimingMetric(sparkContext, "time in aggregation build"),
+    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"),
+    "numTasksFallBacked" -> SQLMetrics.createMetric(sparkContext,
+      "number of tasks fall-backed to sort-based aggregation")
   )
-
-  override def output: Seq[Attribute] = resultExpressions.map(_.toAttribute)
-
-  override def producedAttributes: AttributeSet =
-    AttributeSet(aggregateAttributes) ++
-    AttributeSet(resultExpressions.diff(groupingExpressions).map(_.toAttribute)) ++
-    AttributeSet(aggregateBufferAttributes)
-
-  override def requiredChildDistribution: List[Distribution] = {
-    requiredChildDistributionExpressions match {
-      case Some(exprs) if exprs.isEmpty => AllTuples :: Nil
-      case Some(exprs) if exprs.nonEmpty => ClusteredDistribution(exprs) :: Nil
-      case None => UnspecifiedDistribution :: Nil
-    }
-  }
 
   protected override def doExecute(): RDD[InternalRow] = attachTree(this, "execute") {
     val numOutputRows = longMetric("numOutputRows")
+    val aggTime = longMetric("aggTime")
+    val spillSize = longMetric("spillSize")
+    val numTasksFallBacked = longMetric("numTasksFallBacked")
     val fallbackCountThreshold = sqlContext.conf.objectAggSortBasedFallbackThreshold
 
-    child.execute().mapPartitionsInternal { iter =>
+    child.execute().mapPartitionsWithIndexInternal { (partIndex, iter) =>
+      val beforeAgg = System.nanoTime()
       val hasInput = iter.hasNext
-      if (!hasInput && groupingExpressions.nonEmpty) {
+      val res = if (!hasInput && groupingExpressions.nonEmpty) {
         // This is a grouped aggregate and the input kvIterator is empty,
         // so return an empty kvIterator.
         Iterator.empty
       } else {
         val aggregationIterator =
           new ObjectAggregationIterator(
+            partIndex,
             child.output,
             groupingExpressions,
             aggregateExpressions,
@@ -114,10 +105,13 @@ case class ObjectHashAggregateExec(
             initialInputBufferOffset,
             resultExpressions,
             (expressions, inputSchema) =>
-              newMutableProjection(expressions, inputSchema, subexpressionEliminationEnabled),
-            child.output,
+              MutableProjection.create(expressions, inputSchema),
+            inputAttributes,
             iter,
-            fallbackCountThreshold)
+            fallbackCountThreshold,
+            numOutputRows,
+            spillSize,
+            numTasksFallBacked)
         if (!hasInput && groupingExpressions.isEmpty) {
           numOutputRows += 1
           Iterator.single[UnsafeRow](aggregationIterator.outputForEmptyGroupingKeyWithoutInput())
@@ -125,18 +119,20 @@ case class ObjectHashAggregateExec(
           aggregationIterator
         }
       }
+      aggTime += NANOSECONDS.toMillis(System.nanoTime() - beforeAgg)
+      res
     }
   }
 
-  override def verboseString: String = toString(verbose = true)
+  override def verboseString(maxFields: Int): String = toString(verbose = true, maxFields)
 
-  override def simpleString: String = toString(verbose = false)
+  override def simpleString(maxFields: Int): String = toString(verbose = false, maxFields)
 
-  private def toString(verbose: Boolean): String = {
+  private def toString(verbose: Boolean, maxFields: Int): String = {
     val allAggregateExpressions = aggregateExpressions
-    val keyString = Utils.truncatedString(groupingExpressions, "[", ", ", "]")
-    val functionString = Utils.truncatedString(allAggregateExpressions, "[", ", ", "]")
-    val outputString = Utils.truncatedString(output, "[", ", ", "]")
+    val keyString = truncatedString(groupingExpressions, "[", ", ", "]", maxFields)
+    val functionString = truncatedString(allAggregateExpressions, "[", ", ", "]", maxFields)
+    val outputString = truncatedString(output, "[", ", ", "]", maxFields)
     if (verbose) {
       s"ObjectHashAggregate(keys=$keyString, functions=$functionString, output=$outputString)"
     } else {

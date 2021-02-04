@@ -17,30 +17,40 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import java.util.{ServiceConfigurationError, ServiceLoader}
+import java.util.{Locale, ServiceConfigurationError, ServiceLoader}
 
 import scala.collection.JavaConverters._
-import scala.language.{existentials, implicitConversions}
 import scala.util.{Failure, Success, Try}
-import scala.util.control.NonFatal
 
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 
+import org.apache.spark.SparkException
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStorageFormat, CatalogTable}
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStorageFormat, CatalogTable, CatalogUtils}
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
+import org.apache.spark.sql.connector.catalog.TableProvider
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.command.DataWritingCommand
 import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcRelationProvider
 import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+import org.apache.spark.sql.execution.datasources.v2.FileDataSourceV2
+import org.apache.spark.sql.execution.datasources.v2.orc.OrcDataSourceV2
 import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.execution.streaming.sources.{RateStreamProvider, TextSocketSourceProvider}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.streaming.OutputMode
-import org.apache.spark.sql.types.{CalendarIntervalType, StructType}
-import org.apache.spark.util.Utils
+import org.apache.spark.sql.types.{CalendarIntervalType, StructField, StructType}
+import org.apache.spark.sql.util.SchemaUtils
+import org.apache.spark.util.{HadoopFSUtils, ThreadUtils, Utils}
 
 /**
  * The main class responsible for representing a pluggable Data Source in Spark SQL. In addition to
@@ -57,12 +67,17 @@ import org.apache.spark.util.Utils
  * metadata.  For example, when reading a partitioned table from a file system, partition columns
  * will be inferred from the directory layout even if they are not specified.
  *
- * @param paths A list of file system paths that hold data.  These will be globbed before and
- *              qualified. This option only works when reading from a [[FileFormat]].
+ * @param paths A list of file system paths that hold data. These will be globbed before if
+ *              the "__globPaths__" option is true, and will be qualified. This option only works
+ *              when reading from a [[FileFormat]].
  * @param userSpecifiedSchema An optional specification of the schema of the data. When present
  *                            we skip attempting to infer the schema.
- * @param partitionColumns A list of column names that the relation is partitioned by. When this
- *                         list is empty, the relation is unpartitioned.
+ * @param partitionColumns A list of column names that the relation is partitioned by. This list is
+ *                         generally empty during the read path, unless this DataSource is managed
+ *                         by Hive. In these cases, during `resolveRelation`, we will call
+ *                         `getOrInferFileFormatSchema` for file based DataSources to infer the
+ *                         partitioning. In other cases, if this list is empty, then this table
+ *                         is unpartitioned.
  * @param bucketSpec An optional specification for bucketing (hash-partitioning) of the data.
  * @param catalogTable Optional catalog table reference that can be used to push down operations
  *                     over the datasource to the catalog service.
@@ -79,40 +94,142 @@ case class DataSource(
 
   case class SourceInfo(name: String, schema: StructType, partitionColumns: Seq[String])
 
-  lazy val providingClass: Class[_] = DataSource.lookupDataSource(className)
-  lazy val sourceInfo = sourceSchema()
-  private val caseInsensitiveOptions = new CaseInsensitiveMap(options)
+  lazy val providingClass: Class[_] = {
+    val cls = DataSource.lookupDataSource(className, sparkSession.sessionState.conf)
+    // `providingClass` is used for resolving data source relation for catalog tables.
+    // As now catalog for data source V2 is under development, here we fall back all the
+    // [[FileDataSourceV2]] to [[FileFormat]] to guarantee the current catalog works.
+    // [[FileDataSourceV2]] will still be used if we call the load()/save() method in
+    // [[DataFrameReader]]/[[DataFrameWriter]], since they use method `lookupDataSource`
+    // instead of `providingClass`.
+    cls.newInstance() match {
+      case f: FileDataSourceV2 => f.fallbackFileFormat
+      case _ => cls
+    }
+  }
+
+  private def providingInstance() = providingClass.getConstructor().newInstance()
+
+  private def newHadoopConfiguration(): Configuration =
+    sparkSession.sessionState.newHadoopConfWithOptions(options)
+
+  lazy val sourceInfo: SourceInfo = sourceSchema()
+  private val caseInsensitiveOptions = CaseInsensitiveMap(options)
+  private val equality = sparkSession.sessionState.conf.resolver
 
   /**
-   * Infer the schema of the given FileFormat, returns a pair of schema and partition column names.
+   * Whether or not paths should be globbed before being used to access files.
    */
-  private def inferFileFormatSchema(format: FileFormat): (StructType, Seq[String]) = {
-    userSpecifiedSchema.map(_ -> partitionColumns).orElse {
-      val allPaths = caseInsensitiveOptions.get("path")
-      val globbedPaths = allPaths.toSeq.flatMap { path =>
-        val hdfsPath = new Path(path)
-        val fs = hdfsPath.getFileSystem(sparkSession.sessionState.newHadoopConf())
-        val qualified = hdfsPath.makeQualified(fs.getUri, fs.getWorkingDirectory)
-        SparkHadoopUtil.get.globPathIfNecessary(qualified)
-      }.toArray
-      val fileCatalog = new InMemoryFileIndex(sparkSession, globbedPaths, options, None)
-      val partitionSchema = fileCatalog.partitionSpec().partitionColumns
-      val inferred = format.inferSchema(
-        sparkSession,
-        caseInsensitiveOptions,
-        fileCatalog.allFiles())
+  def globPaths: Boolean = {
+    options.get(DataSource.GLOB_PATHS_KEY)
+      .map(_ == "true")
+      .getOrElse(true)
+  }
 
-      inferred.map { inferredSchema =>
-        StructType(inferredSchema ++ partitionSchema) -> partitionSchema.map(_.name)
+  bucketSpec.map { bucket =>
+    SchemaUtils.checkColumnNameDuplication(
+      bucket.bucketColumnNames, "in the bucket definition", equality)
+    SchemaUtils.checkColumnNameDuplication(
+      bucket.sortColumnNames, "in the sort definition", equality)
+  }
+
+  /**
+   * Get the schema of the given FileFormat, if provided by `userSpecifiedSchema`, or try to infer
+   * it. In the read path, only managed tables by Hive provide the partition columns properly when
+   * initializing this class. All other file based data sources will try to infer the partitioning,
+   * and then cast the inferred types to user specified dataTypes if the partition columns exist
+   * inside `userSpecifiedSchema`, otherwise we can hit data corruption bugs like SPARK-18510.
+   * This method will try to skip file scanning whether `userSpecifiedSchema` and
+   * `partitionColumns` are provided. Here are some code paths that use this method:
+   *   1. `spark.read` (no schema): Most amount of work. Infer both schema and partitioning columns
+   *   2. `spark.read.schema(userSpecifiedSchema)`: Parse partitioning columns, cast them to the
+   *     dataTypes provided in `userSpecifiedSchema` if they exist or fallback to inferred
+   *     dataType if they don't.
+   *   3. `spark.readStream.schema(userSpecifiedSchema)`: For streaming use cases, users have to
+   *     provide the schema. Here, we also perform partition inference like 2, and try to use
+   *     dataTypes in `userSpecifiedSchema`. All subsequent triggers for this stream will re-use
+   *     this information, therefore calls to this method should be very cheap, i.e. there won't
+   *     be any further inference in any triggers.
+   *
+   * @param format the file format object for this DataSource
+   * @param getFileIndex [[InMemoryFileIndex]] for getting partition schema and file list
+   * @return A pair of the data schema (excluding partition columns) and the schema of the partition
+   *         columns.
+   */
+  private def getOrInferFileFormatSchema(
+      format: FileFormat,
+      getFileIndex: () => InMemoryFileIndex): (StructType, StructType) = {
+    lazy val tempFileIndex = getFileIndex()
+
+    val partitionSchema = if (partitionColumns.isEmpty) {
+      // Try to infer partitioning, because no DataSource in the read path provides the partitioning
+      // columns properly unless it is a Hive DataSource
+      tempFileIndex.partitionSchema
+    } else {
+      // maintain old behavior before SPARK-18510. If userSpecifiedSchema is empty used inferred
+      // partitioning
+      if (userSpecifiedSchema.isEmpty) {
+        val inferredPartitions = tempFileIndex.partitionSchema
+        inferredPartitions
+      } else {
+        val partitionFields = partitionColumns.map { partitionColumn =>
+          userSpecifiedSchema.flatMap(_.find(c => equality(c.name, partitionColumn))).orElse {
+            val inferredPartitions = tempFileIndex.partitionSchema
+            val inferredOpt = inferredPartitions.find(p => equality(p.name, partitionColumn))
+            if (inferredOpt.isDefined) {
+              logDebug(
+                s"""Type of partition column: $partitionColumn not found in specified schema
+                   |for $format.
+                   |User Specified Schema
+                   |=====================
+                   |${userSpecifiedSchema.orNull}
+                   |
+                   |Falling back to inferred dataType if it exists.
+                 """.stripMargin)
+            }
+            inferredOpt
+          }.getOrElse {
+            throw new AnalysisException(s"Failed to resolve the schema for $format for " +
+              s"the partition column: $partitionColumn. It must be specified manually.")
+          }
+        }
+        StructType(partitionFields)
       }
-    }.getOrElse {
-      throw new AnalysisException("Unable to infer schema. It must be specified manually.")
     }
+
+    val dataSchema = userSpecifiedSchema.map { schema =>
+      StructType(schema.filterNot(f => partitionSchema.exists(p => equality(p.name, f.name))))
+    }.orElse {
+      // Remove "path" option so that it is not added to the paths returned by
+      // `tempFileIndex.allFiles()`.
+      format.inferSchema(
+        sparkSession,
+        caseInsensitiveOptions - "path",
+        tempFileIndex.allFiles())
+    }.getOrElse {
+      throw new AnalysisException(
+        s"Unable to infer schema for $format. It must be specified manually.")
+    }
+
+    // We just print a warning message if the data schema and partition schema have the duplicate
+    // columns. This is because we allow users to do so in the previous Spark releases and
+    // we have the existing tests for the cases (e.g., `ParquetHadoopFsRelationSuite`).
+    // See SPARK-18108 and SPARK-21144 for related discussions.
+    try {
+      SchemaUtils.checkColumnNameDuplication(
+        (dataSchema ++ partitionSchema).map(_.name),
+        "in the data schema and the partition schema",
+        equality)
+    } catch {
+      case e: AnalysisException => logWarning(e.getMessage)
+    }
+
+    (dataSchema, partitionSchema)
   }
 
   /** Returns the name and schema of the source that can be used to continually read data. */
   private def sourceSchema(): SourceInfo = {
-    providingClass.newInstance() match {
+    providingInstance() match {
       case s: StreamSourceProvider =>
         val (name, schema) = s.sourceSchema(
           sparkSession.sqlContext, userSpecifiedSchema, className, caseInsensitiveOptions)
@@ -127,8 +244,8 @@ case class DataSource(
         // For glob pattern, we do not check it because the glob pattern might only make sense
         // once the streaming job starts and some upstream source starts dropping data.
         val hdfsPath = new Path(path)
-        if (!SparkHadoopUtil.get.isGlobPath(hdfsPath)) {
-          val fs = hdfsPath.getFileSystem(sparkSession.sessionState.newHadoopConf())
+        if (!globPaths || !SparkHadoopUtil.get.isGlobPath(hdfsPath)) {
+          val fs = hdfsPath.getFileSystem(newHadoopConfiguration())
           if (!fs.exists(hdfsPath)) {
             throw new AnalysisException(s"Path does not exist: $path")
           }
@@ -144,8 +261,22 @@ case class DataSource(
               "you may be able to create a static DataFrame on that directory with " +
               "'spark.read.load(directory)' and infer schema from it.")
         }
-        val (schema, partCols) = inferFileFormatSchema(format)
-        SourceInfo(s"FileSource[$path]", schema, partCols)
+
+        val (dataSchema, partitionSchema) = getOrInferFileFormatSchema(format, () => {
+          // The operations below are expensive therefore try not to do them if we don't need to,
+          // e.g., in streaming mode, we have already inferred and registered partition columns,
+          // we will never have to materialize the lazy val below
+          val globbedPaths =
+            checkAndGlobPathIfNecessary(checkEmptyGlobPath = false, checkFilesExist = false)
+          createInMemoryFileIndex(globbedPaths)
+        })
+        val forceNullable =
+          sparkSession.sessionState.conf.getConf(SQLConf.FILE_SOURCE_SCHEMA_FORCE_NULLABLE)
+        val sourceDataSchema = if (forceNullable) dataSchema.asNullable else dataSchema
+        SourceInfo(
+          s"FileSource[$path]",
+          StructType(sourceDataSchema ++ partitionSchema),
+          partitionSchema.fieldNames)
 
       case _ =>
         throw new UnsupportedOperationException(
@@ -155,7 +286,7 @@ case class DataSource(
 
   /** Returns a source that can be used to continually read data. */
   def createSource(metadataPath: String): Source = {
-    providingClass.newInstance() match {
+    providingInstance() match {
       case s: StreamSourceProvider =>
         s.createSource(
           sparkSession.sqlContext,
@@ -184,7 +315,7 @@ case class DataSource(
 
   /** Returns a sink that can be used to continually write data. */
   def createSink(outputMode: OutputMode): Sink = {
-    providingClass.newInstance() match {
+    providingInstance() match {
       case s: StreamSinkProvider =>
         s.createSink(sparkSession.sqlContext, caseInsensitiveOptions, partitionColumns, outputMode)
 
@@ -193,7 +324,7 @@ case class DataSource(
           throw new IllegalArgumentException("'path' is not specified")
         })
         if (outputMode != OutputMode.Append) {
-          throw new IllegalArgumentException(
+          throw new AnalysisException(
             s"Data source $className does not support $outputMode output mode")
         }
         new FileStreamSink(sparkSession, path, fileFormat, partitionColumns, caseInsensitiveOptions)
@@ -201,28 +332,6 @@ case class DataSource(
       case _ =>
         throw new UnsupportedOperationException(
           s"Data source $className does not support streamed writing")
-    }
-  }
-
-  /**
-   * Returns true if there is a single path that has a metadata log indicating which files should
-   * be read.
-   */
-  def hasMetadata(path: Seq[String]): Boolean = {
-    path match {
-      case Seq(singlePath) =>
-        try {
-          val hdfsPath = new Path(singlePath)
-          val fs = hdfsPath.getFileSystem(sparkSession.sessionState.newHadoopConf())
-          val metadataPath = new Path(hdfsPath, FileStreamSink.metadataDir)
-          val res = fs.exists(metadataPath)
-          res
-        } catch {
-          case NonFatal(e) =>
-            logWarning(s"Error while looking for metadata directory.")
-            false
-        }
-      case _ => false
     }
   }
 
@@ -237,7 +346,7 @@ case class DataSource(
    *                        that files already exist, we don't need to check them again.
    */
   def resolveRelation(checkFilesExist: Boolean = true): BaseRelation = {
-    val relation = (providingClass.newInstance(), userSpecifiedSchema) match {
+    val relation = (providingInstance(), userSpecifiedSchema) match {
       // TODO: Throw when too much is given.
       case (dataSource: SchemaRelationProvider, Some(schema)) =>
         dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions, schema)
@@ -249,20 +358,31 @@ case class DataSource(
         val baseRelation =
           dataSource.createRelation(sparkSession.sqlContext, caseInsensitiveOptions)
         if (baseRelation.schema != schema) {
-          throw new AnalysisException(s"$className does not allow user-specified schemas.")
+          throw new AnalysisException(
+            "The user-specified schema doesn't match the actual schema: " +
+            s"user-specified: ${schema.toDDL}, actual: ${baseRelation.schema.toDDL}. If " +
+            "you're using DataFrameReader.schema API or creating a table, please do not " +
+            "specify the schema. Or if you're scanning an existed table, please drop " +
+            "it and re-create it.")
         }
         baseRelation
 
       // We are reading from the results of a streaming query. Load files from the metadata log
       // instead of listing them using HDFS APIs.
       case (format: FileFormat, _)
-          if hasMetadata(caseInsensitiveOptions.get("path").toSeq ++ paths) =>
+          if FileStreamSink.hasMetadata(
+            caseInsensitiveOptions.get("path").toSeq ++ paths,
+            newHadoopConfiguration(),
+            sparkSession.sessionState.conf) =>
         val basePath = new Path((caseInsensitiveOptions.get("path").toSeq ++ paths).head)
-        val fileCatalog = new MetadataLogFileIndex(sparkSession, basePath)
+        val fileCatalog = new MetadataLogFileIndex(sparkSession, basePath,
+          caseInsensitiveOptions, userSpecifiedSchema)
         val dataSchema = userSpecifiedSchema.orElse {
+          // Remove "path" option so that it is not added to the paths returned by
+          // `fileCatalog.allFiles()`.
           format.inferSchema(
             sparkSession,
-            caseInsensitiveOptions,
+            caseInsensitiveOptions - "path",
             fileCatalog.allFiles())
         }.getOrElse {
           throw new AnalysisException(
@@ -272,7 +392,7 @@ case class DataSource(
 
         HadoopFsRelation(
           fileCatalog,
-          partitionSchema = fileCatalog.partitionSpec().partitionColumns,
+          partitionSchema = fileCatalog.partitionSchema,
           dataSchema = dataSchema,
           bucketSpec = None,
           format,
@@ -280,63 +400,28 @@ case class DataSource(
 
       // This is a non-streaming file based datasource.
       case (format: FileFormat, _) =>
-        val allPaths = caseInsensitiveOptions.get("path") ++ paths
-        val globbedPaths = allPaths.flatMap { path =>
-          val hdfsPath = new Path(path)
-          val fs = hdfsPath.getFileSystem(sparkSession.sessionState.newHadoopConf())
-          val qualified = hdfsPath.makeQualified(fs.getUri, fs.getWorkingDirectory)
-          val globPath = SparkHadoopUtil.get.globPathIfNecessary(qualified)
-
-          if (globPath.isEmpty) {
-            throw new AnalysisException(s"Path does not exist: $qualified")
-          }
-          // Sufficient to check head of the globPath seq for non-glob scenario
-          if (checkFilesExist && !fs.exists(globPath.head)) {
-            throw new AnalysisException(s"Path does not exist: ${globPath.head}")
-          }
-          globPath
-        }.toArray
-
-        // If they gave a schema, then we try and figure out the types of the partition columns
-        // from that schema.
-        val partitionSchema = userSpecifiedSchema.map { schema =>
-          StructType(
-            partitionColumns.map { c =>
-              // TODO: Case sensitivity.
-              schema
-                  .find(_.name.toLowerCase() == c.toLowerCase())
-                  .getOrElse(throw new AnalysisException(s"Invalid partition column '$c'"))
-            })
-        }
-
-        val fileCatalog = if (sparkSession.sqlContext.conf.manageFilesourcePartitions &&
-            catalogTable.isDefined && catalogTable.get.tracksPartitionsInCatalog) {
-          new CatalogFileIndex(
+        val useCatalogFileIndex = sparkSession.sqlContext.conf.manageFilesourcePartitions &&
+          catalogTable.isDefined && catalogTable.get.tracksPartitionsInCatalog &&
+          catalogTable.get.partitionColumnNames.nonEmpty
+        val (fileCatalog, dataSchema, partitionSchema) = if (useCatalogFileIndex) {
+          val defaultTableSize = sparkSession.sessionState.conf.defaultSizeInBytes
+          val index = new CatalogFileIndex(
             sparkSession,
             catalogTable.get,
-            catalogTable.get.stats.map(_.sizeInBytes.toLong).getOrElse(0L))
+            catalogTable.get.stats.map(_.sizeInBytes.toLong).getOrElse(defaultTableSize))
+          (index, catalogTable.get.dataSchema, catalogTable.get.partitionSchema)
         } else {
-          new InMemoryFileIndex(
-            sparkSession, globbedPaths, options, partitionSchema)
-        }
-
-        val dataSchema = userSpecifiedSchema.map { schema =>
-          val equality = sparkSession.sessionState.conf.resolver
-          StructType(schema.filterNot(f => partitionColumns.exists(equality(_, f.name))))
-        }.orElse {
-          format.inferSchema(
-            sparkSession,
-            caseInsensitiveOptions,
-            fileCatalog.asInstanceOf[InMemoryFileIndex].allFiles())
-        }.getOrElse {
-          throw new AnalysisException(
-            s"Unable to infer schema for $format at ${allPaths.take(2).mkString(",")}. " +
-              "It must be specified manually")
+          val globbedPaths = checkAndGlobPathIfNecessary(
+            checkEmptyGlobPath = true, checkFilesExist = checkFilesExist)
+          val index = createInMemoryFileIndex(globbedPaths)
+          val (resultDataSchema, resultPartitionSchema) =
+            getOrInferFileFormatSchema(format, () => index)
+          (index, resultDataSchema, resultPartitionSchema)
         }
 
         HadoopFsRelation(
           fileCatalog,
-          partitionSchema = fileCatalog.partitionSchema,
+          partitionSchema = partitionSchema,
           dataSchema = dataSchema.asNullable,
           bucketSpec = bucketSpec,
           format,
@@ -347,100 +432,166 @@ case class DataSource(
           s"$className is not a valid Spark SQL Data Source.")
     }
 
+    relation match {
+      case hs: HadoopFsRelation =>
+        SchemaUtils.checkSchemaColumnNameDuplication(
+          hs.dataSchema,
+          "in the data schema",
+          equality)
+        SchemaUtils.checkSchemaColumnNameDuplication(
+          hs.partitionSchema,
+          "in the partition schema",
+          equality)
+        DataSourceUtils.verifySchema(hs.fileFormat, hs.dataSchema)
+      case _ =>
+        SchemaUtils.checkSchemaColumnNameDuplication(
+          relation.schema,
+          "in the data schema",
+          equality)
+    }
+
     relation
   }
 
-  /** Writes the given [[DataFrame]] out to this [[DataSource]]. */
-  def write(
+  /**
+   * Creates a command node to write the given [[LogicalPlan]] out to the given [[FileFormat]].
+   * The returned command is unresolved and need to be analyzed.
+   */
+  private def planForWritingFileFormat(
+      format: FileFormat, mode: SaveMode, data: LogicalPlan): InsertIntoHadoopFsRelationCommand = {
+    // Don't glob path for the write path.  The contracts here are:
+    //  1. Only one output path can be specified on the write path;
+    //  2. Output path must be a legal HDFS style file system path;
+    //  3. It's OK that the output path doesn't exist yet;
+    val allPaths = paths ++ caseInsensitiveOptions.get("path")
+    val outputPath = if (allPaths.length == 1) {
+      val path = new Path(allPaths.head)
+      val fs = path.getFileSystem(newHadoopConfiguration())
+      path.makeQualified(fs.getUri, fs.getWorkingDirectory)
+    } else {
+      throw new IllegalArgumentException("Expected exactly one path to be specified, but " +
+        s"got: ${allPaths.mkString(", ")}")
+    }
+
+    val caseSensitive = sparkSession.sessionState.conf.caseSensitiveAnalysis
+    PartitioningUtils.validatePartitionColumn(data.schema, partitionColumns, caseSensitive)
+
+    val fileIndex = catalogTable.map(_.identifier).map { tableIdent =>
+      sparkSession.table(tableIdent).queryExecution.analyzed.collect {
+        case LogicalRelation(t: HadoopFsRelation, _, _, _) => t.location
+      }.head
+    }
+    // For partitioned relation r, r.schema's column ordering can be different from the column
+    // ordering of data.logicalPlan (partition columns are all moved after data column).  This
+    // will be adjusted within InsertIntoHadoopFsRelation.
+    InsertIntoHadoopFsRelationCommand(
+      outputPath = outputPath,
+      staticPartitions = Map.empty,
+      ifPartitionNotExists = false,
+      partitionColumns = partitionColumns.map(UnresolvedAttribute.quoted),
+      bucketSpec = bucketSpec,
+      fileFormat = format,
+      options = options,
+      query = data,
+      mode = mode,
+      catalogTable = catalogTable,
+      fileIndex = fileIndex,
+      outputColumnNames = data.output.map(_.name))
+  }
+
+  /**
+   * Writes the given [[LogicalPlan]] out to this [[DataSource]] and returns a [[BaseRelation]] for
+   * the following reading.
+   *
+   * @param mode The save mode for this writing.
+   * @param data The input query plan that produces the data to be written. Note that this plan
+   *             is analyzed and optimized.
+   * @param outputColumnNames The original output column names of the input query plan. The
+   *                          optimizer may not preserve the output column's names' case, so we need
+   *                          this parameter instead of `data.output`.
+   * @param physicalPlan The physical plan of the input query plan. We should run the writing
+   *                     command with this physical plan instead of creating a new physical plan,
+   *                     so that the metrics can be correctly linked to the given physical plan and
+   *                     shown in the web UI.
+   */
+  def writeAndRead(
       mode: SaveMode,
-      data: DataFrame): BaseRelation = {
-    if (data.schema.map(_.dataType).exists(_.isInstanceOf[CalendarIntervalType])) {
+      data: LogicalPlan,
+      outputColumnNames: Seq[String],
+      physicalPlan: SparkPlan): BaseRelation = {
+    val outputColumns = DataWritingCommand.logicalPlanOutputWithNames(data, outputColumnNames)
+    if (outputColumns.map(_.dataType).exists(_.isInstanceOf[CalendarIntervalType])) {
       throw new AnalysisException("Cannot save interval data type into external storage.")
     }
 
-    providingClass.newInstance() match {
+    providingInstance() match {
       case dataSource: CreatableRelationProvider =>
-        dataSource.createRelation(sparkSession.sqlContext, mode, caseInsensitiveOptions, data)
+        dataSource.createRelation(
+          sparkSession.sqlContext, mode, caseInsensitiveOptions, Dataset.ofRows(sparkSession, data))
       case format: FileFormat =>
-        // Don't glob path for the write path.  The contracts here are:
-        //  1. Only one output path can be specified on the write path;
-        //  2. Output path must be a legal HDFS style file system path;
-        //  3. It's OK that the output path doesn't exist yet;
-        val allPaths = paths ++ caseInsensitiveOptions.get("path")
-        val outputPath = if (allPaths.length == 1) {
-          val path = new Path(allPaths.head)
-          val fs = path.getFileSystem(sparkSession.sessionState.newHadoopConf())
-          path.makeQualified(fs.getUri, fs.getWorkingDirectory)
-        } else {
-          throw new IllegalArgumentException("Expected exactly one path to be specified, but " +
-            s"got: ${allPaths.mkString(", ")}")
-        }
-
-        val caseSensitive = sparkSession.sessionState.conf.caseSensitiveAnalysis
-        PartitioningUtils.validatePartitionColumn(
-          data.schema, partitionColumns, caseSensitive)
-
-        // If we are appending to a table that already exists, make sure the partitioning matches
-        // up.  If we fail to load the table for whatever reason, ignore the check.
-        if (mode == SaveMode.Append) {
-          val existingPartitionColumns = Try {
-            resolveRelation()
-              .asInstanceOf[HadoopFsRelation]
-              .partitionSchema
-              .fieldNames
-              .toSeq
-          }.getOrElse(Seq.empty[String])
-          // TODO: Case sensitivity.
-          val sameColumns =
-            existingPartitionColumns.map(_.toLowerCase()) == partitionColumns.map(_.toLowerCase())
-          if (existingPartitionColumns.nonEmpty && !sameColumns) {
+        val cmd = planForWritingFileFormat(format, mode, data)
+        val resolvedPartCols = cmd.partitionColumns.map { col =>
+          // The partition columns created in `planForWritingFileFormat` should always be
+          // `UnresolvedAttribute` with a single name part.
+          assert(col.isInstanceOf[UnresolvedAttribute])
+          val unresolved = col.asInstanceOf[UnresolvedAttribute]
+          assert(unresolved.nameParts.length == 1)
+          val name = unresolved.nameParts.head
+          outputColumns.find(a => equality(a.name, name)).getOrElse {
             throw new AnalysisException(
-              s"""Requested partitioning does not match existing partitioning.
-                 |Existing partitioning columns:
-                 |  ${existingPartitionColumns.mkString(", ")}
-                 |Requested partitioning columns:
-                 |  ${partitionColumns.mkString(", ")}
-                 |""".stripMargin)
+              s"Unable to resolve $name given [${data.output.map(_.name).mkString(", ")}]")
           }
         }
-
-        // SPARK-17230: Resolve the partition columns so InsertIntoHadoopFsRelationCommand does
-        // not need to have the query as child, to avoid to analyze an optimized query,
-        // because InsertIntoHadoopFsRelationCommand will be optimized first.
-        val columns = partitionColumns.map { name =>
-          val plan = data.logicalPlan
-          plan.resolve(name :: Nil, data.sparkSession.sessionState.analyzer.resolver).getOrElse {
-            throw new AnalysisException(
-              s"Unable to resolve $name given [${plan.output.map(_.name).mkString(", ")}]")
-          }.asInstanceOf[Attribute]
-        }
-        // For partitioned relation r, r.schema's column ordering can be different from the column
-        // ordering of data.logicalPlan (partition columns are all moved after data column).  This
-        // will be adjusted within InsertIntoHadoopFsRelation.
-        val plan =
-          InsertIntoHadoopFsRelationCommand(
-            outputPath = outputPath,
-            staticPartitionKeys = Map.empty,
-            customPartitionLocations = Map.empty,
-            partitionColumns = columns,
-            bucketSpec = bucketSpec,
-            fileFormat = format,
-            refreshFunction = _ => Unit, // No existing table needs to be refreshed.
-            options = options,
-            query = data.logicalPlan,
-            mode = mode,
-            catalogTable = catalogTable)
-        sparkSession.sessionState.executePlan(plan).toRdd
-        // Replace the schema with that of the DataFrame we just wrote out to avoid re-inferring it.
-        copy(userSpecifiedSchema = Some(data.schema.asNullable)).resolveRelation()
-
+        val resolved = cmd.copy(
+          partitionColumns = resolvedPartCols,
+          outputColumnNames = outputColumnNames)
+        resolved.run(sparkSession, physicalPlan)
+        // Replace the schema with that of the DataFrame we just wrote out to avoid re-inferring
+        copy(userSpecifiedSchema = Some(outputColumns.toStructType.asNullable)).resolveRelation()
       case _ =>
         sys.error(s"${providingClass.getCanonicalName} does not allow create table as select.")
     }
   }
+
+  /**
+   * Returns a logical plan to write the given [[LogicalPlan]] out to this [[DataSource]].
+   */
+  def planForWriting(mode: SaveMode, data: LogicalPlan): LogicalPlan = {
+    if (data.schema.map(_.dataType).exists(_.isInstanceOf[CalendarIntervalType])) {
+      throw new AnalysisException("Cannot save interval data type into external storage.")
+    }
+
+    providingInstance() match {
+      case dataSource: CreatableRelationProvider =>
+        SaveIntoDataSourceCommand(data, dataSource, caseInsensitiveOptions, mode)
+      case format: FileFormat =>
+        DataSource.validateSchema(data.schema)
+        planForWritingFileFormat(format, mode, data)
+      case _ =>
+        sys.error(s"${providingClass.getCanonicalName} does not allow create table as select.")
+    }
+  }
+
+  /** Returns an [[InMemoryFileIndex]] that can be used to get partition schema and file list. */
+  private def createInMemoryFileIndex(globbedPaths: Seq[Path]): InMemoryFileIndex = {
+    val fileStatusCache = FileStatusCache.getOrCreate(sparkSession)
+    new InMemoryFileIndex(
+      sparkSession, globbedPaths, options, userSpecifiedSchema, fileStatusCache)
+  }
+
+  /**
+   * Checks and returns files in all the paths.
+   */
+  private def checkAndGlobPathIfNecessary(
+      checkEmptyGlobPath: Boolean,
+      checkFilesExist: Boolean): Seq[Path] = {
+    val allPaths = caseInsensitiveOptions.get("path") ++ paths
+    DataSource.checkAndGlobPathIfNecessary(allPaths.toSeq, newHadoopConfiguration(),
+      checkEmptyGlobPath, checkFilesExist, enableGlobbing = globPaths)
+  }
 }
 
-object DataSource {
+object DataSource extends Logging {
 
   /** A map to maintain backward compatibility in case we move data sources around. */
   private val backwardCompatibilityMap: Map[String, String] = {
@@ -450,6 +601,9 @@ object DataSource {
     val csv = classOf[CSVFileFormat].getCanonicalName
     val libsvm = "org.apache.spark.ml.source.libsvm.LibSVMFileFormat"
     val orc = "org.apache.spark.sql.hive.orc.OrcFileFormat"
+    val nativeOrc = classOf[OrcFileFormat].getCanonicalName
+    val socket = classOf[TextSocketSourceProvider].getCanonicalName
+    val rate = classOf[RateStreamProvider].getCanonicalName
 
     Map(
       "org.apache.spark.sql.jdbc" -> jdbc,
@@ -466,9 +620,13 @@ object DataSource {
       "org.apache.spark.sql.execution.datasources.parquet.DefaultSource" -> parquet,
       "org.apache.spark.sql.hive.orc.DefaultSource" -> orc,
       "org.apache.spark.sql.hive.orc" -> orc,
+      "org.apache.spark.sql.execution.datasources.orc.DefaultSource" -> nativeOrc,
+      "org.apache.spark.sql.execution.datasources.orc" -> nativeOrc,
       "org.apache.spark.ml.source.libsvm.DefaultSource" -> libsvm,
       "org.apache.spark.ml.source.libsvm" -> libsvm,
-      "com.databricks.spark.csv" -> csv
+      "com.databricks.spark.csv" -> csv,
+      "org.apache.spark.sql.execution.streaming.TextSocketSourceProvider" -> socket,
+      "org.apache.spark.sql.execution.streaming.RateSourceProvider" -> rate
     )
   }
 
@@ -481,8 +639,18 @@ object DataSource {
     "org.apache.spark.Logging")
 
   /** Given a provider name, look up the data source class definition. */
-  def lookupDataSource(provider: String): Class[_] = {
-    val provider1 = backwardCompatibilityMap.getOrElse(provider, provider)
+  def lookupDataSource(provider: String, conf: SQLConf): Class[_] = {
+    val provider1 = backwardCompatibilityMap.getOrElse(provider, provider) match {
+      case name if name.equalsIgnoreCase("orc") &&
+          conf.getConf(SQLConf.ORC_IMPLEMENTATION) == "native" =>
+        classOf[OrcDataSourceV2].getCanonicalName
+      case name if name.equalsIgnoreCase("orc") &&
+          conf.getConf(SQLConf.ORC_IMPLEMENTATION) == "hive" =>
+        "org.apache.spark.sql.hive.orc.OrcFileFormat"
+      case "com.databricks.spark.avro" if conf.replaceDatabricksSparkAvroEnabled =>
+        "org.apache.spark.sql.avro.AvroFileFormat"
+      case name => name
+    }
     val provider2 = s"$provider1.DefaultSource"
     val loader = Utils.getContextOrSparkClassLoader
     val serviceLoader = ServiceLoader.load(classOf[DataSourceRegister], loader)
@@ -497,20 +665,27 @@ object DataSource {
                 // Found the data source using fully qualified path
                 dataSource
               case Failure(error) =>
-                if (provider1.toLowerCase == "orc" ||
-                  provider1.startsWith("org.apache.spark.sql.hive.orc")) {
+                if (provider1.startsWith("org.apache.spark.sql.hive.orc")) {
                   throw new AnalysisException(
-                    "The ORC data source must be used with Hive support enabled")
-                } else if (provider1.toLowerCase == "avro" ||
-                  provider1 == "com.databricks.spark.avro") {
+                    "Hive built-in ORC data source must be used with Hive support enabled. " +
+                    "Please use the native ORC data source by setting 'spark.sql.orc.impl' to " +
+                    "'native'")
+                } else if (provider1.toLowerCase(Locale.ROOT) == "avro" ||
+                  provider1 == "com.databricks.spark.avro" ||
+                  provider1 == "org.apache.spark.sql.avro") {
                   throw new AnalysisException(
-                    s"Failed to find data source: ${provider1.toLowerCase}. Please find an Avro " +
-                      "package at " +
-                      "https://cwiki.apache.org/confluence/display/SPARK/Third+Party+Projects")
+                    s"Failed to find data source: $provider1. Avro is built-in but external data " +
+                    "source module since Spark 2.4. Please deploy the application as per " +
+                    "the deployment section of \"Apache Avro Data Source Guide\".")
+                } else if (provider1.toLowerCase(Locale.ROOT) == "kafka") {
+                  throw new AnalysisException(
+                    s"Failed to find data source: $provider1. Please deploy the application as " +
+                    "per the deployment section of " +
+                    "\"Structured Streaming + Kafka Integration Guide\".")
                 } else {
                   throw new ClassNotFoundException(
                     s"Failed to find data source: $provider1. Please find packages at " +
-                      "https://cwiki.apache.org/confluence/display/SPARK/Third+Party+Projects",
+                      "http://spark.apache.org/third-party-projects.html",
                     error)
                 }
             }
@@ -529,10 +704,19 @@ object DataSource {
           // there is exactly one registered alias
           head.getClass
         case sources =>
-          // There are multiple registered aliases for the input
-          sys.error(s"Multiple sources found for $provider1 " +
-            s"(${sources.map(_.getClass.getName).mkString(", ")}), " +
-            "please specify the fully qualified class name.")
+          // There are multiple registered aliases for the input. If there is single datasource
+          // that has "org.apache.spark" package in the prefix, we use it considering it is an
+          // internal datasource within Spark.
+          val sourceNames = sources.map(_.getClass.getName)
+          val internalSources = sources.filter(_.getClass.getName.startsWith("org.apache.spark"))
+          if (internalSources.size == 1) {
+            logWarning(s"Multiple sources found for $provider1 (${sourceNames.mkString(", ")}), " +
+              s"defaulting to the internal datasource (${internalSources.head.getClass.getName}).")
+            internalSources.head.getClass
+          } else {
+            throw new AnalysisException(s"Multiple sources found for $provider1 " +
+              s"(${sourceNames.mkString(", ")}), please specify the fully qualified class name.")
+          }
       }
     } catch {
       case e: ServiceConfigurationError if e.getCause.isInstanceOf[NoClassDefFoundError] =>
@@ -549,13 +733,130 @@ object DataSource {
   }
 
   /**
+   * Returns an optional [[TableProvider]] instance for the given provider. It returns None if
+   * there is no corresponding Data Source V2 implementation, or the provider is configured to
+   * fallback to Data Source V1 code path.
+   */
+  def lookupDataSourceV2(provider: String, conf: SQLConf): Option[TableProvider] = {
+    val useV1Sources = conf.getConf(SQLConf.USE_V1_SOURCE_LIST).toLowerCase(Locale.ROOT)
+      .split(",").map(_.trim)
+    val cls = lookupDataSource(provider, conf)
+    cls.newInstance() match {
+      case d: DataSourceRegister if useV1Sources.contains(d.shortName()) => None
+      case t: TableProvider
+          if !useV1Sources.contains(cls.getCanonicalName.toLowerCase(Locale.ROOT)) =>
+        Some(t)
+      case _ => None
+    }
+  }
+
+  /**
+   * The key in the "options" map for deciding whether or not to glob paths before use.
+   */
+  val GLOB_PATHS_KEY = "__globPaths__"
+
+  /**
+   * Checks and returns files in all the paths.
+   */
+  private[sql] def checkAndGlobPathIfNecessary(
+      pathStrings: Seq[String],
+      hadoopConf: Configuration,
+      checkEmptyGlobPath: Boolean,
+      checkFilesExist: Boolean,
+      numThreads: Integer = 40,
+      enableGlobbing: Boolean): Seq[Path] = {
+    val qualifiedPaths = pathStrings.map { pathString =>
+      val path = new Path(pathString)
+      val fs = path.getFileSystem(hadoopConf)
+      path.makeQualified(fs.getUri, fs.getWorkingDirectory)
+    }
+
+    // Split the paths into glob and non glob paths, because we don't need to do an existence check
+    // for globbed paths.
+    val (globPaths, nonGlobPaths) = qualifiedPaths.partition(SparkHadoopUtil.get.isGlobPath)
+
+    val globbedPaths =
+      try {
+        ThreadUtils.parmap(globPaths, "globPath", numThreads) { globPath =>
+          val fs = globPath.getFileSystem(hadoopConf)
+          val globResult = if (enableGlobbing) {
+            SparkHadoopUtil.get.globPath(fs, globPath)
+          } else {
+            qualifiedPaths
+          }
+
+          if (checkEmptyGlobPath && globResult.isEmpty) {
+            throw new AnalysisException(s"Path does not exist: $globPath")
+          }
+
+          globResult
+        }.flatten
+      } catch {
+        case e: SparkException => throw e.getCause
+      }
+
+    if (checkFilesExist) {
+      try {
+        ThreadUtils.parmap(nonGlobPaths, "checkPathsExist", numThreads) { path =>
+          val fs = path.getFileSystem(hadoopConf)
+          if (!fs.exists(path)) {
+            throw new AnalysisException(s"Path does not exist: $path")
+          }
+        }
+      } catch {
+        case e: SparkException => throw e.getCause
+      }
+    }
+
+    val allPaths = globbedPaths ++ nonGlobPaths
+    if (checkFilesExist) {
+      val (filteredOut, filteredIn) = allPaths.partition { path =>
+        HadoopFSUtils.shouldFilterOutPathName(path.getName)
+      }
+      if (filteredIn.isEmpty) {
+        logWarning(
+          s"All paths were ignored:\n  ${filteredOut.mkString("\n  ")}")
+      } else {
+        logDebug(
+          s"Some paths were ignored:\n  ${filteredOut.mkString("\n  ")}")
+      }
+    }
+
+    allPaths
+  }
+
+  /**
    * When creating a data source table, the `path` option has a special meaning: the table location.
    * This method extracts the `path` option and treat it as table location to build a
    * [[CatalogStorageFormat]]. Note that, the `path` option is removed from options after this.
    */
   def buildStorageFormatFromOptions(options: Map[String, String]): CatalogStorageFormat = {
-    val path = new CaseInsensitiveMap(options).get("path")
-    val optionsWithoutPath = options.filterKeys(_.toLowerCase != "path")
-    CatalogStorageFormat.empty.copy(locationUri = path, properties = optionsWithoutPath)
+    val path = CaseInsensitiveMap(options).get("path")
+    val optionsWithoutPath = options.filterKeys(_.toLowerCase(Locale.ROOT) != "path")
+    CatalogStorageFormat.empty.copy(
+      locationUri = path.map(CatalogUtils.stringToURI), properties = optionsWithoutPath.toMap)
+  }
+
+  /**
+   * Called before writing into a FileFormat based data source to make sure the
+   * supplied schema is not empty.
+   * @param schema
+   */
+  def validateSchema(schema: StructType): Unit = {
+    def hasEmptySchema(schema: StructType): Boolean = {
+      schema.size == 0 || schema.exists {
+        case StructField(_, b: StructType, _, _) => hasEmptySchema(b)
+        case _ => false
+      }
+    }
+
+
+    if (hasEmptySchema(schema)) {
+      throw new AnalysisException(
+        s"""
+           |Datasource does not support writing empty or nested empty schemas.
+           |Please make sure the data schema has at least one or more column(s).
+         """.stripMargin)
+    }
   }
 }

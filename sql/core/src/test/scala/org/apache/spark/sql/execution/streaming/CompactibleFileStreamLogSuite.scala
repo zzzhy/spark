@@ -20,16 +20,10 @@ package org.apache.spark.sql.execution.streaming
 import java.io._
 import java.nio.charset.StandardCharsets._
 
-import org.apache.spark.{SparkConf, SparkFunSuite}
-import org.apache.spark.sql.execution.streaming.FakeFileSystem._
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
-class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext {
-
-  /** To avoid caching of FS objects */
-  override protected val sparkConf =
-    new SparkConf().set(s"spark.hadoop.fs.$scheme.impl.disable.cache", "true")
+class CompactibleFileStreamLogSuite extends SharedSparkSession {
 
   import CompactibleFileStreamLog._
 
@@ -92,7 +86,7 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
 
   test("deriveCompactInterval") {
     // latestCompactBatchId(4) + 1 <= default(5)
-    // then use latestestCompactBatchId + 1 === 5
+    // then use latestCompactBatchId + 1 === 5
     assert(5 === deriveCompactInterval(5, 4))
     // First divisor of 10 greater than 4 === 5
     assert(5 === deriveCompactInterval(4, 9))
@@ -104,6 +98,7 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
     withFakeCompactibleFileStreamLog(
       fileCleanupDelayMs = Long.MaxValue,
       defaultCompactInterval = 3,
+      defaultMinBatchesToRetain = 1,
       compactibleLog => {
         assert("0" === compactibleLog.batchIdToPath(0).getName)
         assert("1" === compactibleLog.batchIdToPath(1).getName)
@@ -118,9 +113,10 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
     withFakeCompactibleFileStreamLog(
       fileCleanupDelayMs = Long.MaxValue,
       defaultCompactInterval = 3,
+      defaultMinBatchesToRetain = 1,
       compactibleLog => {
         val logs = Array("entry_1", "entry_2", "entry_3")
-        val expected = s"""${FakeCompactibleFileStreamLog.VERSION}
+        val expected = s"""v${FakeCompactibleFileStreamLog.VERSION}
             |"entry_1"
             |"entry_2"
             |"entry_3"""".stripMargin
@@ -130,7 +126,7 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
 
         baos.reset()
         compactibleLog.serialize(Array(), baos)
-        assert(FakeCompactibleFileStreamLog.VERSION === baos.toString(UTF_8.name()))
+        assert(s"v${FakeCompactibleFileStreamLog.VERSION}" === baos.toString(UTF_8.name()))
       })
   }
 
@@ -138,8 +134,9 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
     withFakeCompactibleFileStreamLog(
       fileCleanupDelayMs = Long.MaxValue,
       defaultCompactInterval = 3,
+      defaultMinBatchesToRetain = 1,
       compactibleLog => {
-        val logs = s"""${FakeCompactibleFileStreamLog.VERSION}
+        val logs = s"""v${FakeCompactibleFileStreamLog.VERSION}
             |"entry_1"
             |"entry_2"
             |"entry_3"""".stripMargin
@@ -149,14 +146,41 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
 
         assert(Nil ===
           compactibleLog.deserialize(
-            new ByteArrayInputStream(FakeCompactibleFileStreamLog.VERSION.getBytes(UTF_8))))
+            new ByteArrayInputStream(s"v${FakeCompactibleFileStreamLog.VERSION}".getBytes(UTF_8))))
       })
   }
 
-  testWithUninterruptibleThread("compact") {
+  test("deserialization log written by future version") {
+    withTempDir { dir =>
+      def newFakeCompactibleFileStreamLog(version: Int): FakeCompactibleFileStreamLog =
+        new FakeCompactibleFileStreamLog(
+          version,
+          _fileCleanupDelayMs = Long.MaxValue, // this param does not matter here in this test case
+          _defaultCompactInterval = 3,         // this param does not matter here in this test case
+          _defaultMinBatchesToRetain = 1,      // this param does not matter here in this test case
+          spark,
+          dir.getCanonicalPath)
+
+      val writer = newFakeCompactibleFileStreamLog(version = 2)
+      val reader = newFakeCompactibleFileStreamLog(version = 1)
+      writer.add(0, Array("entry"))
+      val e = intercept[IllegalStateException] {
+        reader.get(0)
+      }
+      Seq(
+        "maximum supported log version is v1, but encountered v2",
+        "produced by a newer version of Spark and cannot be read by this version"
+      ).foreach { message =>
+        assert(e.getMessage.contains(message))
+      }
+    }
+  }
+
+  test("compact") {
     withFakeCompactibleFileStreamLog(
       fileCleanupDelayMs = Long.MaxValue,
       defaultCompactInterval = 3,
+      defaultMinBatchesToRetain = 1,
       compactibleLog => {
         for (batchId <- 0 to 10) {
           compactibleLog.add(batchId, Array("some_path_" + batchId))
@@ -170,11 +194,12 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
       })
   }
 
-  testWithUninterruptibleThread("delete expired file") {
+  test("delete expired file") {
     // Set `fileCleanupDelayMs` to 0 so that we can detect the deleting behaviour deterministically
     withFakeCompactibleFileStreamLog(
       fileCleanupDelayMs = 0,
       defaultCompactInterval = 3,
+      defaultMinBatchesToRetain = 1,
       compactibleLog => {
         val fs = compactibleLog.metadataPath.getFileSystem(spark.sessionState.newHadoopConf())
 
@@ -194,25 +219,53 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
         compactibleLog.add(1, Array("some_path_1"))
         assert(Set("0", "1") === listBatchFiles())
         compactibleLog.add(2, Array("some_path_2"))
-        assert(Set("2.compact") === listBatchFiles())
+        assert(Set("0", "1", "2.compact") === listBatchFiles())
         compactibleLog.add(3, Array("some_path_3"))
         assert(Set("2.compact", "3") === listBatchFiles())
         compactibleLog.add(4, Array("some_path_4"))
         assert(Set("2.compact", "3", "4") === listBatchFiles())
         compactibleLog.add(5, Array("some_path_5"))
-        assert(Set("5.compact") === listBatchFiles())
+        assert(Set("2.compact", "3", "4", "5.compact") === listBatchFiles())
+        compactibleLog.add(6, Array("some_path_6"))
+        assert(Set("5.compact", "6") === listBatchFiles())
+      })
+  }
+
+  test("prevent removing metadata files via method purge") {
+    withFakeCompactibleFileStreamLog(
+      fileCleanupDelayMs = 10000,
+      defaultCompactInterval = 2,
+      defaultMinBatchesToRetain = 3,
+      compactibleLog => {
+        // compaction batches: 1
+        compactibleLog.add(0, Array("some_path_0"))
+        compactibleLog.add(1, Array("some_path_1"))
+        compactibleLog.add(2, Array("some_path_2"))
+
+        val exc = intercept[UnsupportedOperationException] {
+          compactibleLog.purge(2)
+        }
+        assert(exc.getMessage.contains("Cannot purge as it might break internal state"))
+
+        // Below line would fail with IllegalStateException if we don't prevent purge:
+        // - purge(2) would delete batch 0 and 1 which batch 1 is compaction batch
+        // - allFiles() would read batch 1 (latest compaction) and 2 which batch 1 is deleted
+        compactibleLog.allFiles()
       })
   }
 
   private def withFakeCompactibleFileStreamLog(
     fileCleanupDelayMs: Long,
     defaultCompactInterval: Int,
+    defaultMinBatchesToRetain: Int,
     f: FakeCompactibleFileStreamLog => Unit
   ): Unit = {
     withTempDir { file =>
       val compactibleLog = new FakeCompactibleFileStreamLog(
+        FakeCompactibleFileStreamLog.VERSION,
         fileCleanupDelayMs,
         defaultCompactInterval,
+        defaultMinBatchesToRetain,
         spark,
         file.getCanonicalPath)
       f(compactibleLog)
@@ -221,16 +274,18 @@ class CompactibleFileStreamLogSuite extends SparkFunSuite with SharedSQLContext 
 }
 
 object FakeCompactibleFileStreamLog {
-  val VERSION = "test_version"
+  val VERSION = 1
 }
 
 class FakeCompactibleFileStreamLog(
+    metadataLogVersion: Int,
     _fileCleanupDelayMs: Long,
     _defaultCompactInterval: Int,
+    _defaultMinBatchesToRetain: Int,
     sparkSession: SparkSession,
     path: String)
   extends CompactibleFileStreamLog[String](
-    FakeCompactibleFileStreamLog.VERSION,
+    metadataLogVersion,
     sparkSession,
     path
   ) {
@@ -241,5 +296,5 @@ class FakeCompactibleFileStreamLog(
 
   override protected def defaultCompactInterval: Int = _defaultCompactInterval
 
-  override def compactLogs(logs: Seq[String]): Seq[String] = logs
+  override protected val minBatchesToRetain: Int = _defaultMinBatchesToRetain
 }

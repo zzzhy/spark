@@ -17,21 +17,22 @@
 
 package org.apache.spark.network.util;
 
+import java.util.Locale;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+
 import com.google.common.primitives.Ints;
+import io.netty.util.NettyRuntime;
 
 /**
  * A central location that tracks all the settings we expose to users.
  */
 public class TransportConf {
 
-  static {
-    // Set this due to Netty PR #5661 for Netty 4.0.37+ to work
-    System.setProperty("io.netty.maxDirectMemory", "0");
-  }
-
   private final String SPARK_NETWORK_IO_MODE_KEY;
   private final String SPARK_NETWORK_IO_PREFERDIRECTBUFS_KEY;
   private final String SPARK_NETWORK_IO_CONNECTIONTIMEOUT_KEY;
+  private final String SPARK_NETWORK_IO_CONNECTIONCREATIONTIMEOUT_KEY;
   private final String SPARK_NETWORK_IO_BACKLOG_KEY;
   private final String SPARK_NETWORK_IO_NUMCONNECTIONSPERPEER_KEY;
   private final String SPARK_NETWORK_IO_SERVERTHREADS_KEY;
@@ -42,6 +43,8 @@ public class TransportConf {
   private final String SPARK_NETWORK_IO_MAXRETRIES_KEY;
   private final String SPARK_NETWORK_IO_RETRYWAIT_KEY;
   private final String SPARK_NETWORK_IO_LAZYFD_KEY;
+  private final String SPARK_NETWORK_VERBOSE_METRICS;
+  private final String SPARK_NETWORK_IO_ENABLETCPKEEPALIVE_KEY;
 
   private final ConfigProvider conf;
 
@@ -53,6 +56,7 @@ public class TransportConf {
     SPARK_NETWORK_IO_MODE_KEY = getConfKey("io.mode");
     SPARK_NETWORK_IO_PREFERDIRECTBUFS_KEY = getConfKey("io.preferDirectBufs");
     SPARK_NETWORK_IO_CONNECTIONTIMEOUT_KEY = getConfKey("io.connectionTimeout");
+    SPARK_NETWORK_IO_CONNECTIONCREATIONTIMEOUT_KEY = getConfKey("io.connectionCreationTimeout");
     SPARK_NETWORK_IO_BACKLOG_KEY = getConfKey("io.backLog");
     SPARK_NETWORK_IO_NUMCONNECTIONSPERPEER_KEY =  getConfKey("io.numConnectionsPerPeer");
     SPARK_NETWORK_IO_SERVERTHREADS_KEY = getConfKey("io.serverThreads");
@@ -63,25 +67,37 @@ public class TransportConf {
     SPARK_NETWORK_IO_MAXRETRIES_KEY = getConfKey("io.maxRetries");
     SPARK_NETWORK_IO_RETRYWAIT_KEY = getConfKey("io.retryWait");
     SPARK_NETWORK_IO_LAZYFD_KEY = getConfKey("io.lazyFD");
+    SPARK_NETWORK_VERBOSE_METRICS = getConfKey("io.enableVerboseMetrics");
+    SPARK_NETWORK_IO_ENABLETCPKEEPALIVE_KEY = getConfKey("io.enableTcpKeepAlive");
   }
 
   public int getInt(String name, int defaultValue) {
     return conf.getInt(name, defaultValue);
   }
 
+  public String get(String name, String defaultValue) {
+    return conf.get(name, defaultValue);
+  }
+
   private String getConfKey(String suffix) {
     return "spark." + module + "." + suffix;
   }
 
+  public String getModuleName() {
+    return module;
+  }
+
   /** IO mode: nio or epoll */
-  public String ioMode() { return conf.get(SPARK_NETWORK_IO_MODE_KEY, "NIO").toUpperCase(); }
+  public String ioMode() {
+    return conf.get(SPARK_NETWORK_IO_MODE_KEY, "NIO").toUpperCase(Locale.ROOT);
+  }
 
   /** If true, we will prefer allocating off-heap byte buffers within Netty. */
   public boolean preferDirectBufs() {
     return conf.getBoolean(SPARK_NETWORK_IO_PREFERDIRECTBUFS_KEY, true);
   }
 
-  /** Connect timeout in milliseconds. Default 120 secs. */
+  /** Connection idle timeout in milliseconds. Default 120 secs. */
   public int connectionTimeoutMs() {
     long defaultNetworkTimeoutS = JavaUtils.timeStringAsSec(
       conf.get("spark.network.timeout", "120s"));
@@ -90,12 +106,24 @@ public class TransportConf {
     return (int) defaultTimeoutMs;
   }
 
+  /** Connect creation timeout in milliseconds. Default 30 secs. */
+  public int connectionCreationTimeoutMs() {
+    long connectionTimeoutS = TimeUnit.MILLISECONDS.toSeconds(connectionTimeoutMs());
+    long defaultTimeoutMs = JavaUtils.timeStringAsSec(
+      conf.get(SPARK_NETWORK_IO_CONNECTIONCREATIONTIMEOUT_KEY,  connectionTimeoutS + "s")) * 1000;
+    return (int) defaultTimeoutMs;
+  }
+
   /** Number of concurrent connections between two nodes for fetching data. */
   public int numConnectionsPerPeer() {
     return conf.getInt(SPARK_NETWORK_IO_NUMCONNECTIONSPERPEER_KEY, 1);
   }
 
-  /** Requested maximum length of the queue of incoming connections. Default -1 for no backlog. */
+  /**
+   * Requested maximum length of the queue of incoming connections. If  &lt; 1,
+   * the default Netty value of {@link io.netty.util.NetUtil#SOMAXCONN} will be used.
+   * Default to -1.
+   */
   public int backLog() { return conf.getInt(SPARK_NETWORK_IO_BACKLOG_KEY, -1); }
 
   /** Number of threads used in the server thread pool. Default to 0, which is 2x#cores. */
@@ -116,9 +144,10 @@ public class TransportConf {
   /** Send buffer size (SO_SNDBUF). */
   public int sendBuf() { return conf.getInt(SPARK_NETWORK_IO_SENDBUFFER_KEY, -1); }
 
-  /** Timeout for a single round trip of SASL token exchange, in milliseconds. */
-  public int saslRTTimeoutMs() {
-    return (int) JavaUtils.timeStringAsSec(conf.get(SPARK_NETWORK_SASL_TIMEOUT_KEY, "30s")) * 1000;
+  /** Timeout for a single round trip of auth message exchange, in milliseconds. */
+  public int authRTTimeoutMs() {
+    return (int) JavaUtils.timeStringAsSec(conf.get("spark.network.auth.rpcTimeout",
+      conf.get(SPARK_NETWORK_SASL_TIMEOUT_KEY, "30s"))) * 1000;
   }
 
   /**
@@ -154,6 +183,22 @@ public class TransportConf {
   }
 
   /**
+   * Whether to track Netty memory detailed metrics. If true, the detailed metrics of Netty
+   * PoolByteBufAllocator will be gotten, otherwise only general memory usage will be tracked.
+   */
+  public boolean verboseMetrics() {
+    return conf.getBoolean(SPARK_NETWORK_VERBOSE_METRICS, false);
+  }
+
+  /**
+   * Whether to enable TCP keep-alive. If true, the TCP keep-alives are enabled, which removes
+   * connections that are idle for too long.
+   */
+  public boolean enableTcpKeepAlive() {
+    return conf.getBoolean(SPARK_NETWORK_IO_ENABLETCPKEEPALIVE_KEY, false);
+  }
+
+  /**
    * Maximum number of retries when binding to a port before giving up.
    */
   public int portMaxRetries() {
@@ -161,7 +206,77 @@ public class TransportConf {
   }
 
   /**
-   * Maximum number of bytes to be encrypted at a time when SASL encryption is enabled.
+   * Enables strong encryption. Also enables the new auth protocol, used to negotiate keys.
+   */
+  public boolean encryptionEnabled() {
+    return conf.getBoolean("spark.network.crypto.enabled", false);
+  }
+
+  /**
+   * The cipher transformation to use for encrypting session data.
+   */
+  public String cipherTransformation() {
+    return conf.get("spark.network.crypto.cipher", "AES/CTR/NoPadding");
+  }
+
+  /**
+   * The key generation algorithm. This should be an algorithm that accepts a "PBEKeySpec"
+   * as input. The default value (PBKDF2WithHmacSHA1) is available in Java 7.
+   */
+  public String keyFactoryAlgorithm() {
+    return conf.get("spark.network.crypto.keyFactoryAlgorithm", "PBKDF2WithHmacSHA1");
+  }
+
+  /**
+   * How many iterations to run when generating keys.
+   *
+   * See some discussion about this at: http://security.stackexchange.com/q/3959
+   * The default value was picked for speed, since it assumes that the secret has good entropy
+   * (128 bits by default), which is not generally the case with user passwords.
+   */
+  public int keyFactoryIterations() {
+    return conf.getInt("spark.network.crypto.keyFactoryIterations", 1024);
+  }
+
+  /**
+   * Encryption key length, in bits.
+   */
+  public int encryptionKeyLength() {
+    return conf.getInt("spark.network.crypto.keyLength", 128);
+  }
+
+  /**
+   * Initial vector length, in bytes.
+   */
+  public int ivLength() {
+    return conf.getInt("spark.network.crypto.ivLength", 16);
+  }
+
+  /**
+   * The algorithm for generated secret keys. Nobody should really need to change this,
+   * but configurable just in case.
+   */
+  public String keyAlgorithm() {
+    return conf.get("spark.network.crypto.keyAlgorithm", "AES");
+  }
+
+  /**
+   * Whether to fall back to SASL if the new auth protocol fails. Enabled by default for
+   * backwards compatibility.
+   */
+  public boolean saslFallback() {
+    return conf.getBoolean("spark.network.crypto.saslFallback", true);
+  }
+
+  /**
+   * Whether to enable SASL-based encryption when authenticating using SASL.
+   */
+  public boolean saslEncryption() {
+    return conf.getBoolean("spark.authenticate.enableSaslEncryption", false);
+  }
+
+  /**
+   * Maximum number of bytes to be encrypted at a time when SASL encryption is used.
    */
   public int maxSaslEncryptedBlockSize() {
     return Ints.checkedCast(JavaUtils.byteStringAsBytes(
@@ -176,24 +291,132 @@ public class TransportConf {
   }
 
   /**
-   * The trigger for enabling AES encryption.
+   * Flag indicating whether to share the pooled ByteBuf allocators between the different Netty
+   * channels. If enabled then only two pooled ByteBuf allocators are created: one where caching
+   * is allowed (for transport servers) and one where not (for transport clients).
+   * When disabled a new allocator is created for each transport servers and clients.
    */
-  public boolean aesEncryptionEnabled() {
-    return conf.getBoolean("spark.authenticate.encryption.aes.enabled", false);
+  public boolean sharedByteBufAllocators() {
+    return conf.getBoolean("spark.network.sharedByteBufAllocators.enabled", true);
   }
 
   /**
-   * The implementation class for crypto cipher
-   */
-  public String aesCipherClass() {
-    return conf.get("spark.authenticate.encryption.aes.cipher.class", null);
+  * If enabled then off-heap byte buffers will be preferred for the shared ByteBuf allocators.
+  */
+  public boolean preferDirectBufsForSharedByteBufAllocators() {
+    return conf.getBoolean("spark.network.io.preferDirectBufs", true);
   }
 
   /**
-   * The bytes of AES cipher key which is effective when AES cipher is enabled. Notice that
-   * the length should be 16, 24 or 32 bytes.
+   * The commons-crypto configuration for the module.
    */
-  public int aesCipherKeySize() {
-    return conf.getInt("spark.authenticate.encryption.aes.cipher.keySize", 16);
+  public Properties cryptoConf() {
+    return CryptoUtils.toCryptoConf("spark.network.crypto.config.", conf.getAll());
+  }
+
+  /**
+   * The max number of chunks allowed to be transferred at the same time on shuffle service.
+   * Note that new incoming connections will be closed when the max number is hit. The client will
+   * retry according to the shuffle retry configs (see `spark.shuffle.io.maxRetries` and
+   * `spark.shuffle.io.retryWait`), if those limits are reached the task will fail with fetch
+   * failure.
+   */
+  public long maxChunksBeingTransferred() {
+    return conf.getLong("spark.shuffle.maxChunksBeingTransferred", Long.MAX_VALUE);
+  }
+
+  /**
+   * Percentage of io.serverThreads used by netty to process ChunkFetchRequest.
+   * When the config `spark.shuffle.server.chunkFetchHandlerThreadsPercent` is set,
+   * shuffle server will use a separate EventLoopGroup to process ChunkFetchRequest messages.
+   * Although when calling the async writeAndFlush on the underlying channel to send
+   * response back to client, the I/O on the channel is still being handled by
+   * {@link org.apache.spark.network.server.TransportServer}'s default EventLoopGroup
+   * that's registered with the Channel, by waiting inside the ChunkFetchRequest handler
+   * threads for the completion of sending back responses, we are able to put a limit on
+   * the max number of threads from TransportServer's default EventLoopGroup that are
+   * going to be consumed by writing response to ChunkFetchRequest, which are I/O intensive
+   * and could take long time to process due to disk contentions. By configuring a slightly
+   * higher number of shuffler server threads, we are able to reserve some threads for
+   * handling other RPC messages, thus making the Client less likely to experience timeout
+   * when sending RPC messages to the shuffle server. The number of threads used for handling
+   * chunked fetch requests are percentage of io.serverThreads (if defined) else it is a percentage
+   * of 2 * #cores. However, a percentage of 0 means netty default number of threads which
+   * is 2 * #cores ignoring io.serverThreads. The percentage here is configured via
+   * spark.shuffle.server.chunkFetchHandlerThreadsPercent. The returned value is rounded off to
+   * ceiling of the nearest integer.
+   */
+  public int chunkFetchHandlerThreads() {
+    if (!this.getModuleName().equalsIgnoreCase("shuffle")) {
+      return 0;
+    }
+    int chunkFetchHandlerThreadsPercent =
+      Integer.parseInt(conf.get("spark.shuffle.server.chunkFetchHandlerThreadsPercent"));
+    int threads =
+      this.serverThreads() > 0 ? this.serverThreads() : 2 * NettyRuntime.availableProcessors();
+    return (int) Math.ceil(threads * (chunkFetchHandlerThreadsPercent / 100.0));
+  }
+
+  /**
+   * Whether to use a separate EventLoopGroup to process ChunkFetchRequest messages, it is decided
+   * by the config `spark.shuffle.server.chunkFetchHandlerThreadsPercent` is set or not.
+   */
+  public boolean separateChunkFetchRequest() {
+    return conf.getInt("spark.shuffle.server.chunkFetchHandlerThreadsPercent", 0) > 0;
+  }
+
+  /**
+   * Whether to use the old protocol while doing the shuffle block fetching.
+   * It is only enabled while we need the compatibility in the scenario of new spark version
+   * job fetching blocks from old version external shuffle service.
+   */
+  public boolean useOldFetchProtocol() {
+    return conf.getBoolean("spark.shuffle.useOldFetchProtocol", false);
+  }
+
+  /**
+   * Class name of the implementation of MergedShuffleFileManager that merges the blocks
+   * pushed to it when push-based shuffle is enabled. By default, push-based shuffle is disabled at
+   * a cluster level because this configuration is set to
+   * 'org.apache.spark.network.shuffle.ExternalBlockHandler$NoOpMergedShuffleFileManager'.
+   * To turn on push-based shuffle at a cluster level, set the configuration to
+   * 'org.apache.spark.network.shuffle.RemoteBlockPushResolver'.
+   */
+  public String mergedShuffleFileManagerImpl() {
+    return conf.get("spark.shuffle.server.mergedShuffleFileManagerImpl",
+      "org.apache.spark.network.shuffle.ExternalBlockHandler$NoOpMergedShuffleFileManager");
+  }
+
+  /**
+   * The minimum size of a chunk when dividing a merged shuffle file into multiple chunks during
+   * push-based shuffle.
+   * A merged shuffle file consists of multiple small shuffle blocks. Fetching the
+   * complete merged shuffle file in a single response increases the memory requirements for the
+   * clients. Instead of serving the entire merged file, the shuffle service serves the
+   * merged file in `chunks`. A `chunk` constitutes few shuffle blocks in entirety and this
+   * configuration controls how big a chunk can get. A corresponding index file for each merged
+   * shuffle file will be generated indicating chunk boundaries.
+   */
+  public int minChunkSizeInMergedShuffleFile() {
+    return Ints.checkedCast(JavaUtils.byteStringAsBytes(
+      conf.get("spark.shuffle.server.minChunkSizeInMergedShuffleFile", "2m")));
+  }
+
+  /**
+   * The size of cache in memory which is used in push-based shuffle for storing merged index files.
+   */
+  public long mergedIndexCacheSize() {
+    return JavaUtils.byteStringAsBytes(
+      conf.get("spark.shuffle.server.mergedIndexCacheSize", "100m"));
+  }
+
+  /**
+   * The threshold for number of IOExceptions while merging shuffle blocks to a shuffle partition.
+   * When the number of IOExceptions while writing to merged shuffle data/index/meta file exceed
+   * this threshold then the shuffle server will respond back to client to stop pushing shuffle
+   * blocks for this shuffle partition.
+   */
+  public int ioExceptionsThresholdDuringMerge() {
+    return conf.getInt("spark.shuffle.server.ioExceptionsThresholdDuringMerge", 4);
   }
 }

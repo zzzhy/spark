@@ -17,10 +17,9 @@
 
 package org.apache.spark.sql.sources
 
-import org.apache.spark.annotation.{DeveloperApi, Experimental, InterfaceStability}
+import org.apache.spark.annotation.{Stable, Unstable}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.streaming.{Sink, Source}
 import org.apache.spark.sql.streaming.OutputMode
@@ -35,7 +34,7 @@ import org.apache.spark.sql.types.StructType
  *
  * @since 1.5.0
  */
-@InterfaceStability.Stable
+@Stable
 trait DataSourceRegister {
 
   /**
@@ -65,7 +64,7 @@ trait DataSourceRegister {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait RelationProvider {
   /**
    * Returns a new base relation with the given parameters.
@@ -91,12 +90,12 @@ trait RelationProvider {
  *
  * The difference between a [[RelationProvider]] and a [[SchemaRelationProvider]] is that
  * users need to provide a schema when using a [[SchemaRelationProvider]].
- * A relation provider can inherits both [[RelationProvider]] and [[SchemaRelationProvider]]
+ * A relation provider can inherit both [[RelationProvider]] and [[SchemaRelationProvider]]
  * if it can support both schema inference and user-specified schemas.
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait SchemaRelationProvider {
   /**
    * Returns a new base relation with the given parameters and user defined schema.
@@ -112,12 +111,11 @@ trait SchemaRelationProvider {
 
 /**
  * ::Experimental::
- * Implemented by objects that can produce a streaming [[Source]] for a specific format or system.
+ * Implemented by objects that can produce a streaming `Source` for a specific format or system.
  *
  * @since 2.0.0
  */
-@Experimental
-@InterfaceStability.Unstable
+@Unstable
 trait StreamSourceProvider {
 
   /**
@@ -143,12 +141,11 @@ trait StreamSourceProvider {
 
 /**
  * ::Experimental::
- * Implemented by objects that can produce a streaming [[Sink]] for a specific format or system.
+ * Implemented by objects that can produce a streaming `Sink` for a specific format or system.
  *
  * @since 2.0.0
  */
-@Experimental
-@InterfaceStability.Unstable
+@Unstable
 trait StreamSinkProvider {
   def createSink(
       sqlContext: SQLContext,
@@ -160,19 +157,16 @@ trait StreamSinkProvider {
 /**
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait CreatableRelationProvider {
   /**
-   * Save the DataFrame to the destination and return a relation with the given parameters based on
-   * the contents of the given DataFrame. The mode specifies the expected behavior of createRelation
-   * when data already exists.
-   * Right now, there are three modes, Append, Overwrite, and ErrorIfExists.
-   * Append mode means that when saving a DataFrame to a data source, if data already exists,
-   * contents of the DataFrame are expected to be appended to existing data.
-   * Overwrite mode means that when saving a DataFrame to a data source, if data already exists,
-   * existing data is expected to be overwritten by the contents of the DataFrame.
-   * ErrorIfExists mode means that when saving a DataFrame to a data source,
-   * if data already exists, an exception is expected to be thrown.
+   * Saves a DataFrame to a destination (using data source-specific parameters)
+   *
+   * @param sqlContext SQLContext
+   * @param mode specifies what happens when the destination already exists
+   * @param parameters data source-specific parameters
+   * @param data DataFrame to save (i.e. the rows after executing the query)
+   * @return Relation with a known schema
    *
    * @since 1.3.0
    */
@@ -185,7 +179,7 @@ trait CreatableRelationProvider {
 
 /**
  * Represents a collection of tuples with a known schema. Classes that extend BaseRelation must
- * be able to produce the schema of their data in the form of a [[StructType]]. Concrete
+ * be able to produce the schema of their data in the form of a `StructType`. Concrete
  * implementation should inherit from one of the descendant `Scan` classes, which define various
  * abstract methods for execution.
  *
@@ -195,7 +189,7 @@ trait CreatableRelationProvider {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 abstract class BaseRelation {
   def sqlContext: SQLContext
   def schema: StructType
@@ -216,10 +210,10 @@ abstract class BaseRelation {
 
   /**
    * Whether does it need to convert the objects in Row to internal representation, for example:
-   *  java.lang.String -> UTF8String
-   *  java.lang.Decimal -> Decimal
+   *  java.lang.String to UTF8String
+   *  java.lang.Decimal to Decimal
    *
-   * If `needConversion` is `false`, buildScan() should return an [[RDD]] of [[InternalRow]]
+   * If `needConversion` is `false`, buildScan() should return an `RDD` of `InternalRow`
    *
    * @note The internal representation is not stable across releases and thus data sources outside
    * of Spark SQL should leave this as true.
@@ -245,7 +239,7 @@ abstract class BaseRelation {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait TableScan {
   def buildScan(): RDD[Row]
 }
@@ -256,7 +250,7 @@ trait TableScan {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait PrunedScan {
   def buildScan(requiredColumns: Array[String]): RDD[Row]
 }
@@ -274,7 +268,7 @@ trait PrunedScan {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait PrunedFilteredScan {
   def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row]
 }
@@ -296,7 +290,7 @@ trait PrunedFilteredScan {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 trait InsertableRelation {
   def insert(data: DataFrame, overwrite: Boolean): Unit
 }
@@ -305,14 +299,13 @@ trait InsertableRelation {
  * ::Experimental::
  * An interface for experimenting with a more direct connection to the query planner.  Compared to
  * [[PrunedFilteredScan]], this operator receives the raw expressions from the
- * [[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan]].  Unlike the other APIs this
+ * `org.apache.spark.sql.catalyst.plans.logical.LogicalPlan`.  Unlike the other APIs this
  * interface is NOT designed to be binary compatible across releases and thus should only be used
  * for experimentation.
  *
  * @since 1.3.0
  */
-@Experimental
-@InterfaceStability.Unstable
+@Unstable
 trait CatalystScan {
   def buildScan(requiredColumns: Seq[Attribute], filters: Seq[Expression]): RDD[Row]
 }

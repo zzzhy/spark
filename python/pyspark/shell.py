@@ -24,29 +24,24 @@ This file is designed to be launched as a PYTHONSTARTUP script.
 import atexit
 import os
 import platform
+import warnings
 
-import py4j
-
-import pyspark
 from pyspark.context import SparkContext
-from pyspark.sql import SparkSession, SQLContext
-from pyspark.storagelevel import StorageLevel
+from pyspark.sql import SparkSession
 
 if os.environ.get("SPARK_EXECUTOR_URI"):
     SparkContext.setSystemProperty("spark.executor.uri", os.environ["SPARK_EXECUTOR_URI"])
 
-SparkContext._ensure_initialized()
+SparkContext._ensure_initialized()  # type: ignore
 
 try:
-    # Try to access HiveConf, it will raise exception if Hive is not added
-    SparkContext._jvm.org.apache.hadoop.hive.conf.HiveConf()
-    spark = SparkSession.builder\
-        .enableHiveSupport()\
-        .getOrCreate()
-except py4j.protocol.Py4JError:
-    spark = SparkSession.builder.getOrCreate()
-except TypeError:
-    spark = SparkSession.builder.getOrCreate()
+    spark = SparkSession._create_shell_session()  # type: ignore
+except Exception:
+    import sys
+    import traceback
+    warnings.warn("Failed to initialize Spark session.")
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
 
 sc = spark.sparkContext
 sql = spark.sql
@@ -56,7 +51,7 @@ atexit.register(lambda: sc.stop())
 sqlContext = spark._wrapped
 sqlCtx = sqlContext
 
-print("""Welcome to
+print(r"""Welcome to
       ____              __
      / __/__  ___ _____/ /__
     _\ \/ _ \/ _ `/ __/  '_/
@@ -67,6 +62,8 @@ print("Using Python version %s (%s, %s)" % (
     platform.python_version(),
     platform.python_build()[0],
     platform.python_build()[1]))
+print("Spark context Web UI available at %s" % (sc.uiWebUrl))
+print("Spark context available as 'sc' (master = %s, app id = %s)." % (sc.master, sc.applicationId))
 print("SparkSession available as 'spark'.")
 
 # The ./bin/pyspark script stores the old PYTHONSTARTUP value in OLD_PYTHONSTARTUP,

@@ -21,17 +21,20 @@ import scala.math.Ordering
 
 import org.json4s.JsonDSL._
 
-import org.apache.spark.annotation.InterfaceStability
+import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.util.ArrayData
+import org.apache.spark.sql.catalyst.util.StringUtils.StringConcat
 
 /**
  * Companion object for ArrayType.
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 object ArrayType extends AbstractDataType {
-  /** Construct a [[ArrayType]] object with the given element type. The `containsNull` is true. */
+  /**
+   * Construct a [[ArrayType]] object with the given element type. The `containsNull` is true.
+   */
   def apply(elementType: DataType): ArrayType = ArrayType(elementType, containsNull = true)
 
   override private[sql] def defaultConcreteType: DataType = ArrayType(NullType, containsNull = true)
@@ -40,14 +43,14 @@ object ArrayType extends AbstractDataType {
     other.isInstanceOf[ArrayType]
   }
 
-  override private[sql] def simpleString: String = "array"
+  override private[spark] def simpleString: String = "array"
 }
 
 /**
  * The data type for collections of multiple values.
  * Internally these are represented as columns that contain a ``scala.collection.Seq``.
  *
- * Please use [[DataTypes.createArrayType()]] to create a specific instance.
+ * Please use `DataTypes.createArrayType()` to create a specific instance.
  *
  * An [[ArrayType]] object comprises two fields, `elementType: [[DataType]]` and
  * `containsNull: Boolean`. The field of `elementType` is used to specify the type of
@@ -58,16 +61,21 @@ object ArrayType extends AbstractDataType {
  *
  * @since 1.3.0
  */
-@InterfaceStability.Stable
+@Stable
 case class ArrayType(elementType: DataType, containsNull: Boolean) extends DataType {
 
   /** No-arg constructor for kryo. */
   protected def this() = this(null, false)
 
-  private[sql] def buildFormattedString(prefix: String, builder: StringBuilder): Unit = {
-    builder.append(
-      s"$prefix-- element: ${elementType.typeName} (containsNull = $containsNull)\n")
-    DataType.buildFormattedString(elementType, s"$prefix    |", builder)
+  private[sql] def buildFormattedString(
+      prefix: String,
+      stringConcat: StringConcat,
+      maxDepth: Int): Unit = {
+    if (maxDepth > 0) {
+      stringConcat.append(
+        s"$prefix-- element: ${elementType.typeName} (containsNull = $containsNull)\n")
+      DataType.buildFormattedString(elementType, s"$prefix    |", stringConcat, maxDepth)
+    }
   }
 
   override private[sql] def jsonValue =
@@ -76,10 +84,10 @@ case class ArrayType(elementType: DataType, containsNull: Boolean) extends DataT
       ("containsNull" -> containsNull)
 
   /**
-   * The default size of a value of the ArrayType is 100 * the default size of the element type.
-   * (We assume that there are 100 elements).
+   * The default size of a value of the ArrayType is the default size of the element type.
+   * We assume that there is only 1 element on average in an array. See SPARK-18853.
    */
-  override def defaultSize: Int = 100 * elementType.defaultSize
+  override def defaultSize: Int = 1 * elementType.defaultSize
 
   override def simpleString: String = s"array<${elementType.simpleString}>"
 
@@ -101,7 +109,8 @@ case class ArrayType(elementType: DataType, containsNull: Boolean) extends DataT
       case a : ArrayType => a.interpretedOrdering.asInstanceOf[Ordering[Any]]
       case s: StructType => s.interpretedOrdering.asInstanceOf[Ordering[Any]]
       case other =>
-        throw new IllegalArgumentException(s"Type $other does not support ordered operations")
+        throw new IllegalArgumentException(
+          s"Type ${other.catalogString} does not support ordered operations")
     }
 
     def compare(x: ArrayData, y: ArrayData): Int = {

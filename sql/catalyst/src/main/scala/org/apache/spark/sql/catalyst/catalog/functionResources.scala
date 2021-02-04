@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql.catalyst.catalog
 
-import org.apache.spark.sql.AnalysisException
+import java.util.Locale
+
+import org.apache.spark.sql.errors.QueryCompilationErrors
 
 /** A trait that represents the type of a resourced needed by a function. */
 abstract class FunctionResourceType(val resourceType: String)
@@ -33,12 +35,12 @@ object ArchiveResource extends FunctionResourceType("archive")
 
 object FunctionResourceType {
   def fromString(resourceType: String): FunctionResourceType = {
-    resourceType.toLowerCase match {
+    resourceType.toLowerCase(Locale.ROOT) match {
       case "jar" => JarResource
       case "file" => FileResource
       case "archive" => ArchiveResource
       case other =>
-        throw new AnalysisException(s"Resource Type '$resourceType' is not supported.")
+        throw QueryCompilationErrors.resourceTypeNotSupportedError(resourceType)
     }
   }
 }

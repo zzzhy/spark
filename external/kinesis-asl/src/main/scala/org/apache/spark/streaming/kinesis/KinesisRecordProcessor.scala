@@ -23,7 +23,7 @@ import scala.util.control.NonFatal
 
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.{InvalidStateException, KinesisClientLibDependencyException, ShutdownException, ThrottlingException}
 import com.amazonaws.services.kinesis.clientlibrary.interfaces.{IRecordProcessor, IRecordProcessorCheckpointer}
-import com.amazonaws.services.kinesis.clientlibrary.types.ShutdownReason
+import com.amazonaws.services.kinesis.clientlibrary.lib.worker.ShutdownReason
 import com.amazonaws.services.kinesis.model.Record
 
 import org.apache.spark.internal.Logging
@@ -51,7 +51,7 @@ private[kinesis] class KinesisRecordProcessor[T](receiver: KinesisReceiver[T], w
    *
    * @param shardId assigned by the KCL to this particular RecordProcessor.
    */
-  override def initialize(shardId: String) {
+  override def initialize(shardId: String): Unit = {
     this.shardId = shardId
     logInfo(s"Initialized workerId $workerId with shardId $shardId")
   }
@@ -65,11 +65,22 @@ private[kinesis] class KinesisRecordProcessor[T](receiver: KinesisReceiver[T], w
    * @param checkpointer used to update Kinesis when this batch has been processed/stored
    *   in the DStream
    */
-  override def processRecords(batch: List[Record], checkpointer: IRecordProcessorCheckpointer) {
+  override def processRecords(batch: List[Record],
+      checkpointer: IRecordProcessorCheckpointer): Unit = {
     if (!receiver.isStopped()) {
       try {
-        receiver.addRecords(shardId, batch)
-        logDebug(s"Stored: Worker $workerId stored ${batch.size} records for shardId $shardId")
+        // Limit the number of processed records from Kinesis stream. This is because the KCL cannot
+        // control the number of aggregated records to be fetched even if we set `MaxRecords`
+        // in `KinesisClientLibConfiguration`. For example, if we set 10 to the number of max
+        // records in a worker and a producer aggregates two records into one message, the worker
+        // possibly 20 records every callback function called.
+        val maxRecords = receiver.getCurrentLimit
+        for (start <- 0 until batch.size by maxRecords) {
+          val miniBatch = batch.subList(start, math.min(start + maxRecords, batch.size))
+          receiver.addRecords(shardId, miniBatch)
+          logDebug(s"Stored: Worker $workerId stored ${miniBatch.size} records " +
+            s"for shardId $shardId")
+        }
         receiver.setCheckpointer(shardId, checkpointer)
       } catch {
         case NonFatal(e) =>

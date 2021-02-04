@@ -17,34 +17,30 @@
 
 package org.apache.spark.sql.execution.datasources
 
-import java.io.FileNotFoundException
-
 import scala.collection.mutable
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs._
-import org.apache.hadoop.mapred.{FileInputFormat, JobConf}
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.metrics.source.HiveCatalogMetrics
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{expressions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.types.{StringType, StructType}
-import org.apache.spark.util.SerializableConfiguration
+import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
+import org.apache.spark.sql.types.StructType
 
 /**
  * An abstract class that represents [[FileIndex]]s that are aware of partitioned tables.
  * It provides the necessary methods to parse partition data based on a set of files.
  *
  * @param parameters as set of options to control partition discovery
- * @param userPartitionSchema an optional partition schema that will be use to provide types for
- *                            the discovered partitions
+ * @param userSpecifiedSchema an optional user specified schema that will be use to provide
+ *                            types for the discovered partitions
  */
 abstract class PartitioningAwareFileIndex(
     sparkSession: SparkSession,
     parameters: Map[String, String],
-    userPartitionSchema: Option[StructType],
+    userSpecifiedSchema: Option[StructType],
     fileStatusCache: FileStatusCache = NoopCache) extends FileIndex with Logging {
   import PartitioningAwareFileIndex.BASE_PATH_PARAM
 
@@ -53,22 +49,41 @@ abstract class PartitioningAwareFileIndex(
 
   override def partitionSchema: StructType = partitionSpec().partitionColumns
 
-  protected val hadoopConf = sparkSession.sessionState.newHadoopConfWithOptions(parameters)
+  protected val hadoopConf: Configuration =
+    sparkSession.sessionState.newHadoopConfWithOptions(parameters)
 
   protected def leafFiles: mutable.LinkedHashMap[Path, FileStatus]
 
   protected def leafDirToChildrenFiles: Map[Path, Array[FileStatus]]
 
-  override def listFiles(filters: Seq[Expression]): Seq[PartitionDirectory] = {
+  private val caseInsensitiveMap = CaseInsensitiveMap(parameters)
+  private val pathFilters = PathFilterFactory.create(caseInsensitiveMap)
+
+  protected def matchPathPattern(file: FileStatus): Boolean =
+    pathFilters.forall(_.accept(file))
+
+  protected lazy val recursiveFileLookup: Boolean = {
+    caseInsensitiveMap.getOrElse("recursiveFileLookup", "false").toBoolean
+  }
+
+  override def listFiles(
+      partitionFilters: Seq[Expression], dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
+    def isNonEmptyFile(f: FileStatus): Boolean = {
+      isDataPath(f.getPath) && f.getLen > 0
+    }
     val selectedPartitions = if (partitionSpec().partitionColumns.isEmpty) {
-      PartitionDirectory(InternalRow.empty, allFiles().filter(f => isDataPath(f.getPath))) :: Nil
+      PartitionDirectory(InternalRow.empty, allFiles().filter(isNonEmptyFile)) :: Nil
     } else {
-      prunePartitions(filters, partitionSpec()).map {
+      if (recursiveFileLookup) {
+        throw new IllegalArgumentException(
+          "Datasource with partition do not allow recursive file loading.")
+      }
+      prunePartitions(partitionFilters, partitionSpec()).map {
         case PartitionPath(values, path) =>
           val files: Seq[FileStatus] = leafDirToChildrenFiles.get(path) match {
             case Some(existingDir) =>
               // Directory has children files in it, return them
-              existingDir.filter(f => isDataPath(f.getPath))
+              existingDir.filter(f => matchPathPattern(f) && isNonEmptyFile(f))
 
             case None =>
               // Directory does not exist, or has no children files
@@ -88,10 +103,10 @@ abstract class PartitioningAwareFileIndex(
   override def sizeInBytes: Long = allFiles().map(_.getLen).sum
 
   def allFiles(): Seq[FileStatus] = {
-    if (partitionSpec().partitionColumns.isEmpty) {
+    val files = if (partitionSpec().partitionColumns.isEmpty && !recursiveFileLookup) {
       // For each of the root input paths, get the list of files inside them
       rootPaths.flatMap { path =>
-        // Make the path qualified (consistent with listLeafFiles and listLeafFilesInParallel).
+        // Make the path qualified (consistent with listLeafFiles and bulkListLeafFiles).
         val fs = path.getFileSystem(hadoopConf)
         val qualifiedPathPre = fs.makeQualified(path)
         val qualifiedPath: Path = if (qualifiedPathPre.isRoot && !qualifiedPathPre.isAbsolute) {
@@ -117,38 +132,30 @@ abstract class PartitioningAwareFileIndex(
     } else {
       leafFiles.values.toSeq
     }
+    files.filter(matchPathPattern)
   }
 
   protected def inferPartitioning(): PartitionSpec = {
-    // We use leaf dirs containing data files to discover the schema.
-    val leafDirs = leafDirToChildrenFiles.filter { case (_, files) =>
-      files.exists(f => isDataPath(f.getPath))
-    }.keys.toSeq
-    userPartitionSchema match {
-      case Some(userProvidedSchema) if userProvidedSchema.nonEmpty =>
-        val spec = PartitioningUtils.parsePartitions(
-          leafDirs,
-          typeInference = false,
-          basePaths = basePaths)
+    if (recursiveFileLookup) {
+      PartitionSpec.emptySpec
+    } else {
+      // We use leaf dirs containing data files to discover the schema.
+      val leafDirs = leafDirToChildrenFiles.filter { case (_, files) =>
+        files.exists(f => isDataPath(f.getPath))
+      }.keys.toSeq
 
-        // Without auto inference, all of value in the `row` should be null or in StringType,
-        // we need to cast into the data type that user specified.
-        def castPartitionValuesToUserSchema(row: InternalRow) = {
-          InternalRow((0 until row.numFields).map { i =>
-            Cast(
-              Literal.create(row.getUTF8String(i), StringType),
-              userProvidedSchema.fields(i).dataType).eval()
-          }: _*)
-        }
+      val caseInsensitiveOptions = CaseInsensitiveMap(parameters)
+      val timeZoneId = caseInsensitiveOptions.get(DateTimeUtils.TIMEZONE_OPTION)
+        .getOrElse(sparkSession.sessionState.conf.sessionLocalTimeZone)
 
-        PartitionSpec(userProvidedSchema, spec.partitions.map { part =>
-          part.copy(values = castPartitionValuesToUserSchema(part.values))
-        })
-      case _ =>
-        PartitioningUtils.parsePartitions(
-          leafDirs,
-          typeInference = sparkSession.sessionState.conf.partitionColumnTypeInferenceEnabled,
-          basePaths = basePaths)
+      PartitioningUtils.parsePartitions(
+        leafDirs,
+        typeInference = sparkSession.sessionState.conf.partitionColumnTypeInferenceEnabled,
+        basePaths = basePaths,
+        userSpecifiedSchema = userSpecifiedSchema,
+        caseSensitive = sparkSession.sqlContext.conf.caseSensitiveAnalysis,
+        validatePartitionColumns = sparkSession.sqlContext.conf.validatePartitionColumns,
+        timeZoneId = timeZoneId)
     }
   }
 
@@ -164,20 +171,21 @@ abstract class PartitioningAwareFileIndex(
     if (partitionPruningPredicates.nonEmpty) {
       val predicate = partitionPruningPredicates.reduce(expressions.And)
 
-      val boundPredicate = InterpretedPredicate.create(predicate.transform {
+      val boundPredicate = Predicate.createInterpreted(predicate.transform {
         case a: AttributeReference =>
           val index = partitionColumns.indexWhere(a.name == _.name)
           BoundReference(index, partitionColumns(index).dataType, nullable = true)
       })
 
       val selected = partitions.filter {
-        case PartitionPath(values, _) => boundPredicate(values)
+        case PartitionPath(values, _) => boundPredicate.eval(values)
       }
       logInfo {
         val total = partitions.length
         val selectedSize = selected.length
         val percentPruned = (1 - selectedSize.toDouble / total.toDouble) * 100
-        s"Selected $selectedSize partitions out of $total, pruned $percentPruned% partitions."
+        s"Selected $selectedSize partitions out of $total, " +
+          s"pruned ${if (total == 0) "0" else s"$percentPruned%"} partitions."
       }
 
       selected
@@ -207,17 +215,25 @@ abstract class PartitioningAwareFileIndex(
    * and the returned DataFrame will have the column of `something`.
    */
   private def basePaths: Set[Path] = {
-    parameters.get(BASE_PATH_PARAM).map(new Path(_)) match {
+    caseInsensitiveMap.get(BASE_PATH_PARAM).map(new Path(_)) match {
       case Some(userDefinedBasePath) =>
         val fs = userDefinedBasePath.getFileSystem(hadoopConf)
         if (!fs.isDirectory(userDefinedBasePath)) {
           throw new IllegalArgumentException(s"Option '$BASE_PATH_PARAM' must be a directory")
         }
-        Set(fs.makeQualified(userDefinedBasePath))
+        val qualifiedBasePath = fs.makeQualified(userDefinedBasePath)
+        val qualifiedBasePathStr = qualifiedBasePath.toString
+        rootPaths
+          .find(!fs.makeQualified(_).toString.startsWith(qualifiedBasePathStr))
+          .foreach { rp =>
+            throw new IllegalArgumentException(
+              s"Wrong basePath $userDefinedBasePath for the root path: $rp")
+          }
+        Set(qualifiedBasePath)
 
       case None =>
         rootPaths.map { path =>
-          // Make the path qualified (consistent with listLeafFiles and listLeafFilesInParallel).
+          // Make the path qualified (consistent with listLeafFiles and bulkListLeafFiles).
           val qualifiedPath = path.getFileSystem(hadoopConf).makeQualified(path)
           if (leafFiles.contains(qualifiedPath)) qualifiedPath.getParent else qualifiedPath }.toSet
     }
@@ -229,209 +245,8 @@ abstract class PartitioningAwareFileIndex(
     val name = path.getName
     !((name.startsWith("_") && !name.contains("=")) || name.startsWith("."))
   }
-
-  /**
-   * List leaf files of given paths. This method will submit a Spark job to do parallel
-   * listing whenever there is a path having more files than the parallel partition discovery
-   * discovery threshold.
-   *
-   * This is publicly visible for testing.
-   */
-  def listLeafFiles(paths: Seq[Path]): mutable.LinkedHashSet[FileStatus] = {
-    val output = mutable.LinkedHashSet[FileStatus]()
-    val pathsToFetch = mutable.ArrayBuffer[Path]()
-    for (path <- paths) {
-      fileStatusCache.getLeafFiles(path) match {
-        case Some(files) =>
-          HiveCatalogMetrics.incrementFileCacheHits(files.length)
-          output ++= files
-        case None =>
-          pathsToFetch += path
-      }
-    }
-    val discovered = if (pathsToFetch.length >=
-        sparkSession.sessionState.conf.parallelPartitionDiscoveryThreshold) {
-      PartitioningAwareFileIndex.listLeafFilesInParallel(pathsToFetch, hadoopConf, sparkSession)
-    } else {
-      PartitioningAwareFileIndex.listLeafFilesInSerial(pathsToFetch, hadoopConf)
-    }
-    discovered.foreach { case (path, leafFiles) =>
-      HiveCatalogMetrics.incrementFilesDiscovered(leafFiles.size)
-      fileStatusCache.putLeafFiles(path, leafFiles.toArray)
-      output ++= leafFiles
-    }
-    output
-  }
 }
 
-object PartitioningAwareFileIndex extends Logging {
+object PartitioningAwareFileIndex {
   val BASE_PATH_PARAM = "basePath"
-
-  /** A serializable variant of HDFS's BlockLocation. */
-  private case class SerializableBlockLocation(
-      names: Array[String],
-      hosts: Array[String],
-      offset: Long,
-      length: Long)
-
-  /** A serializable variant of HDFS's FileStatus. */
-  private case class SerializableFileStatus(
-      path: String,
-      length: Long,
-      isDir: Boolean,
-      blockReplication: Short,
-      blockSize: Long,
-      modificationTime: Long,
-      accessTime: Long,
-      blockLocations: Array[SerializableBlockLocation])
-
-  /**
-   * List a collection of path recursively.
-   */
-  private def listLeafFilesInSerial(
-      paths: Seq[Path],
-      hadoopConf: Configuration): Seq[(Path, Seq[FileStatus])] = {
-    // Dummy jobconf to get to the pathFilter defined in configuration
-    val jobConf = new JobConf(hadoopConf, this.getClass)
-    val filter = FileInputFormat.getInputPathFilter(jobConf)
-
-    paths.map { path =>
-      val fs = path.getFileSystem(hadoopConf)
-      (path, listLeafFiles0(fs, path, filter))
-    }
-  }
-
-  /**
-   * List a collection of path recursively in parallel (using Spark executors).
-   * Each task launched will use [[listLeafFilesInSerial]] to list.
-   */
-  private def listLeafFilesInParallel(
-      paths: Seq[Path],
-      hadoopConf: Configuration,
-      sparkSession: SparkSession): Seq[(Path, Seq[FileStatus])] = {
-    assert(paths.size >= sparkSession.sessionState.conf.parallelPartitionDiscoveryThreshold)
-    logInfo(s"Listing leaf files and directories in parallel under: ${paths.mkString(", ")}")
-
-    val sparkContext = sparkSession.sparkContext
-    val serializableConfiguration = new SerializableConfiguration(hadoopConf)
-    val serializedPaths = paths.map(_.toString)
-    val parallelPartitionDiscoveryParallelism =
-      sparkSession.sessionState.conf.parallelPartitionDiscoveryParallelism
-
-    // Set the number of parallelism to prevent following file listing from generating many tasks
-    // in case of large #defaultParallelism.
-    val numParallelism = Math.min(paths.size, parallelPartitionDiscoveryParallelism)
-
-    val statusMap = sparkContext
-      .parallelize(serializedPaths, numParallelism)
-      .mapPartitions { paths =>
-        val hadoopConf = serializableConfiguration.value
-        listLeafFilesInSerial(paths.map(new Path(_)).toSeq, hadoopConf).iterator
-      }.map { case (path, statuses) =>
-        val serializableStatuses = statuses.map { status =>
-          // Turn FileStatus into SerializableFileStatus so we can send it back to the driver
-          val blockLocations = status match {
-            case f: LocatedFileStatus =>
-              f.getBlockLocations.map { loc =>
-                SerializableBlockLocation(
-                  loc.getNames,
-                  loc.getHosts,
-                  loc.getOffset,
-                  loc.getLength)
-              }
-
-            case _ =>
-              Array.empty[SerializableBlockLocation]
-          }
-
-          SerializableFileStatus(
-            status.getPath.toString,
-            status.getLen,
-            status.isDirectory,
-            status.getReplication,
-            status.getBlockSize,
-            status.getModificationTime,
-            status.getAccessTime,
-            blockLocations)
-        }
-        (path.toString, serializableStatuses)
-      }.collect()
-
-    // turn SerializableFileStatus back to Status
-    statusMap.map { case (path, serializableStatuses) =>
-      val statuses = serializableStatuses.map { f =>
-        val blockLocations = f.blockLocations.map { loc =>
-          new BlockLocation(loc.names, loc.hosts, loc.offset, loc.length)
-        }
-        new LocatedFileStatus(
-          new FileStatus(
-            f.length, f.isDir, f.blockReplication, f.blockSize, f.modificationTime,
-            new Path(f.path)),
-          blockLocations)
-      }
-      (new Path(path), statuses)
-    }
-  }
-
-  /**
-   * List a single path, provided as a FileStatus, in serial.
-   */
-  private def listLeafFiles0(
-      fs: FileSystem, path: Path, filter: PathFilter): Seq[FileStatus] = {
-    logTrace(s"Listing $path")
-    val name = path.getName.toLowerCase
-    if (shouldFilterOut(name)) {
-      Seq.empty[FileStatus]
-    } else {
-      // [SPARK-17599] Prevent InMemoryFileIndex from failing if path doesn't exist
-      // Note that statuses only include FileStatus for the files and dirs directly under path,
-      // and does not include anything else recursively.
-      val statuses = try fs.listStatus(path) catch {
-        case _: FileNotFoundException =>
-          logWarning(s"The directory $path was not found. Was it deleted very recently?")
-          Array.empty[FileStatus]
-      }
-
-      val allLeafStatuses = {
-        val (dirs, files) = statuses.partition(_.isDirectory)
-        val stats = files ++ dirs.flatMap(dir => listLeafFiles0(fs, dir.getPath, filter))
-        if (filter != null) stats.filter(f => filter.accept(f.getPath)) else stats
-      }
-
-      allLeafStatuses.filterNot(status => shouldFilterOut(status.getPath.getName)).map {
-        case f: LocatedFileStatus =>
-          f
-
-        // NOTE:
-        //
-        // - Although S3/S3A/S3N file system can be quite slow for remote file metadata
-        //   operations, calling `getFileBlockLocations` does no harm here since these file system
-        //   implementations don't actually issue RPC for this method.
-        //
-        // - Here we are calling `getFileBlockLocations` in a sequential manner, but it should not
-        //   be a big deal since we always use to `listLeafFilesInParallel` when the number of
-        //   paths exceeds threshold.
-        case f =>
-          // The other constructor of LocatedFileStatus will call FileStatus.getPermission(),
-          // which is very slow on some file system (RawLocalFileSystem, which is launch a
-          // subprocess and parse the stdout).
-          val locations = fs.getFileBlockLocations(f, 0, f.getLen)
-          val lfs = new LocatedFileStatus(f.getLen, f.isDirectory, f.getReplication, f.getBlockSize,
-            f.getModificationTime, 0, null, null, null, null, f.getPath, locations)
-          if (f.isSymlink) {
-            lfs.setSymlink(f.getSymlink)
-          }
-          lfs
-      }
-    }
-  }
-
-  /** Checks if we should filter out this path name. */
-  def shouldFilterOut(pathName: String): Boolean = {
-    // We filter everything that starts with _ and ., except _common_metadata and _metadata
-    // because Parquet needs to find those metadata files from leaf files returned by this method.
-    // We should refactor this logic to not mix metadata files with data files.
-    ((pathName.startsWith("_") && !pathName.contains("=")) || pathName.startsWith(".")) &&
-      !pathName.startsWith("_common_metadata") && !pathName.startsWith("_metadata")
-  }
 }

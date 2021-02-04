@@ -20,10 +20,9 @@ package org.apache.spark.mllib.recommendation
 import java.io.IOException
 import java.lang.{Integer => JavaInteger}
 
-import scala.collection.mutable
-
 import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
+import com.google.common.collect.{Ordering => GuavaOrdering}
 import org.apache.hadoop.fs.Path
 import org.json4s._
 import org.json4s.JsonDSL._
@@ -33,7 +32,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.{JavaPairRDD, JavaRDD}
 import org.apache.spark.internal.Logging
-import org.apache.spark.mllib.linalg._
+import org.apache.spark.mllib.linalg.BLAS
 import org.apache.spark.mllib.rdd.MLPairRDDFunctions._
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
@@ -79,8 +78,13 @@ class MatrixFactorizationModel @Since("0.8.0") (
   /** Predict the rating of one user for one product. */
   @Since("0.8.0")
   def predict(user: Int, product: Int): Double = {
-    val userVector = userFeatures.lookup(user).head
-    val productVector = productFeatures.lookup(product).head
+    val userFeatureSeq = userFeatures.lookup(user)
+    require(userFeatureSeq.nonEmpty, s"userId: $user not found in the model")
+    val productFeatureSeq = productFeatures.lookup(product)
+    require(productFeatureSeq.nonEmpty, s"productId: $product not found in the model")
+
+    val userVector = userFeatureSeq.head
+    val productVector = productFeatureSeq.head
     blas.ddot(rank, userVector, 1, productVector, 1)
   }
 
@@ -146,7 +150,7 @@ class MatrixFactorizationModel @Since("0.8.0") (
   }
 
   /**
-   * Java-friendly version of [[MatrixFactorizationModel.predict]].
+   * Java-friendly version of `MatrixFactorizationModel.predict`.
    */
   @Since("1.2.0")
   def predict(usersProducts: JavaPairRDD[JavaInteger, JavaInteger]): JavaRDD[Rating] = {
@@ -165,9 +169,12 @@ class MatrixFactorizationModel @Since("0.8.0") (
    *  recommended the product is.
    */
   @Since("1.1.0")
-  def recommendProducts(user: Int, num: Int): Array[Rating] =
-    MatrixFactorizationModel.recommend(userFeatures.lookup(user).head, productFeatures, num)
+  def recommendProducts(user: Int, num: Int): Array[Rating] = {
+    val userFeatureSeq = userFeatures.lookup(user)
+    require(userFeatureSeq.nonEmpty, s"userId: $user not found in the model")
+    MatrixFactorizationModel.recommend(userFeatureSeq.head, productFeatures, num)
       .map(t => Rating(user, t._1, t._2))
+  }
 
   /**
    * Recommends users to a product. That is, this returns users who are most likely to be
@@ -182,11 +189,12 @@ class MatrixFactorizationModel @Since("0.8.0") (
    *  recommended the user is.
    */
   @Since("1.1.0")
-  def recommendUsers(product: Int, num: Int): Array[Rating] =
-    MatrixFactorizationModel.recommend(productFeatures.lookup(product).head, userFeatures, num)
+  def recommendUsers(product: Int, num: Int): Array[Rating] = {
+    val productFeatureSeq = productFeatures.lookup(product)
+    require(productFeatureSeq.nonEmpty, s"productId: $product not found in the model")
+    MatrixFactorizationModel.recommend(productFeatureSeq.head, userFeatures, num)
       .map(t => Rating(t._1, product, t._2))
-
-  protected override val formatVersion: String = "1.0"
+  }
 
   /**
    * Save this model to the given path.
@@ -195,7 +203,7 @@ class MatrixFactorizationModel @Since("0.8.0") (
    *  - human-readable (JSON) model metadata to path/metadata/
    *  - Parquet formatted data to path/data/
    *
-   * The model may be loaded using [[Loader.load]].
+   * The model may be loaded using `Loader.load`.
    *
    * @param sc  Spark context used to save model data.
    * @param path  Path specifying the directory in which to save this model.
@@ -262,6 +270,20 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
 
   /**
    * Makes recommendations for all users (or products).
+   *
+   * Note: the previous approach used for computing top-k recommendations aimed to group
+   * individual factor vectors into blocks, so that Level 3 BLAS operations (gemm) could
+   * be used for efficiency. However, this causes excessive GC pressure due to the large
+   * arrays required for intermediate result storage, as well as a high sensitivity to the
+   * block size used.
+   *
+   * This approach groups factors into blocks and computes the top-k elements per block,
+   * using GEMV (it use less memory compared with GEMM, and is much faster than DOT) and
+   * an efficient selection based on [[GuavaOrdering]] (instead of [[BoundedPriorityQueue]]).
+   * It then computes the global top-k by aggregating the per block top-k elements with
+   * a [[BoundedPriorityQueue]]. This significantly reduces the size of intermediate and
+   * shuffle data.
+   *
    * @param rank rank
    * @param srcFeatures src features to receive recommendations
    * @param dstFeatures dst features used to make recommendations
@@ -274,53 +296,60 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       srcFeatures: RDD[(Int, Array[Double])],
       dstFeatures: RDD[(Int, Array[Double])],
       num: Int): RDD[(Int, Array[(Int, Double)])] = {
-    val srcBlocks = blockify(rank, srcFeatures)
-    val dstBlocks = blockify(rank, dstFeatures)
-    val ratings = srcBlocks.cartesian(dstBlocks).flatMap {
-      case ((srcIds, srcFactors), (dstIds, dstFactors)) =>
-        val m = srcIds.length
-        val n = dstIds.length
-        val ratings = srcFactors.transpose.multiply(dstFactors)
-        val output = new Array[(Int, (Int, Double))](m * n)
-        var k = 0
-        ratings.foreachActive { (i, j, r) =>
-          output(k) = (srcIds(i), (dstIds(j), r))
-          k += 1
+    import scala.collection.JavaConverters._
+    val srcBlocks = blockify(srcFeatures)
+    val dstBlocks = blockify(dstFeatures)
+
+    val ratings = srcBlocks.cartesian(dstBlocks)
+      .mapPartitions { iter =>
+        var scores: Array[Double] = null
+        var idxOrd: GuavaOrdering[Int] = null
+        iter.flatMap { case ((srcIds, srcMat), (dstIds, dstMat)) =>
+          require(srcMat.length == srcIds.length * rank)
+          require(dstMat.length == dstIds.length * rank)
+          val m = srcIds.length
+          val n = dstIds.length
+          if (scores == null || scores.length < n) {
+            scores = Array.ofDim[Double](n)
+            idxOrd = new GuavaOrdering[Int] {
+              override def compare(left: Int, right: Int): Int = {
+                Ordering[Double].compare(scores(left), scores(right))
+              }
+            }
+          }
+
+          Iterator.range(0, m).flatMap { i =>
+            // scores = i-th vec in srcMat * dstMat
+            BLAS.f2jBLAS.dgemv("T", rank, n, 1.0F, dstMat, 0, rank,
+              srcMat, i * rank, 1, 0.0F, scores, 0, 1)
+
+            val srcId = srcIds(i)
+            idxOrd.greatestOf(Iterator.range(0, n).asJava, num).asScala
+              .iterator.map { j => (srcId, (dstIds(j), scores(j))) }
+          }
         }
-        output.toSeq
-    }
+      }
+
     ratings.topByKey(num)(Ordering.by(_._2))
   }
 
   /**
-   * Blockifies features to use Level-3 BLAS.
+   * Blockifies features to improve the efficiency of cartesian product
+   * TODO: SPARK-20443 - expose blockSize as a param?
    */
   private def blockify(
-      rank: Int,
-      features: RDD[(Int, Array[Double])]): RDD[(Array[Int], DenseMatrix)] = {
-    val blockSize = 4096 // TODO: tune the block size
-    val blockStorage = rank * blockSize
+      features: RDD[(Int, Array[Double])],
+      blockSize: Int = 4096): RDD[(Array[Int], Array[Double])] = {
     features.mapPartitions { iter =>
-      iter.grouped(blockSize).map { grouped =>
-        val ids = mutable.ArrayBuilder.make[Int]
-        ids.sizeHint(blockSize)
-        val factors = mutable.ArrayBuilder.make[Double]
-        factors.sizeHint(blockStorage)
-        var i = 0
-        grouped.foreach { case (id, factor) =>
-          ids += id
-          factors ++= factor
-          i += 1
-        }
-        (ids.result(), new DenseMatrix(rank, i, factors.result()))
-      }
+      iter.grouped(blockSize)
+        .map(block => (block.map(_._1).toArray, block.flatMap(_._2).toArray))
     }
   }
 
   /**
    * Load a model from the given path.
    *
-   * The model should have been saved by [[Saveable.save]].
+   * The model should have been saved by `Saveable.save`.
    *
    * @param sc  Spark context used for loading model files.
    * @param path  Path specifying the directory to which the model was saved.
@@ -371,12 +400,12 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       assert(formatVersion == thisFormatVersion)
       val rank = (metadata \ "rank").extract[Int]
       val userFeatures = spark.read.parquet(userPath(path)).rdd.map {
-        case Row(id: Int, features: Seq[_]) =>
-          (id, features.asInstanceOf[Seq[Double]].toArray)
+        case Row(id: Int, features: scala.collection.Seq[_]) =>
+          (id, features.asInstanceOf[scala.collection.Seq[Double]].toArray)
       }
       val productFeatures = spark.read.parquet(productPath(path)).rdd.map {
-        case Row(id: Int, features: Seq[_]) =>
-          (id, features.asInstanceOf[Seq[Double]].toArray)
+        case Row(id: Int, features: scala.collection.Seq[_]) =>
+          (id, features.asInstanceOf[scala.collection.Seq[Double]].toArray)
       }
       new MatrixFactorizationModel(rank, userFeatures, productFeatures)
     }

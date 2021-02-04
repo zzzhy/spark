@@ -21,12 +21,11 @@ import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapreduce._
 import org.apache.parquet.hadoop.ParquetOutputFormat
 
-import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.datasources.OutputWriter
 
 // NOTE: This class is instantiated and used on executor side only, no need to be serializable.
-private[parquet] class ParquetOutputWriter(path: String, context: TaskAttemptContext)
+class ParquetOutputWriter(path: String, context: TaskAttemptContext)
   extends OutputWriter {
 
   private val recordWriter: RecordWriter[Void, InternalRow] = {
@@ -37,9 +36,7 @@ private[parquet] class ParquetOutputWriter(path: String, context: TaskAttemptCon
     }.getRecordWriter(context)
   }
 
-  override def write(row: Row): Unit = throw new UnsupportedOperationException("call writeInternal")
-
-  override def writeInternal(row: InternalRow): Unit = recordWriter.write(null, row)
+  override def write(row: InternalRow): Unit = recordWriter.write(null, row)
 
   override def close(): Unit = recordWriter.close(context)
 }

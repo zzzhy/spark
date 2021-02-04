@@ -23,8 +23,11 @@ import static org.mockito.Mockito.*;
 import java.io.File;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeoutException;
@@ -32,7 +35,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.security.sasl.SaslException;
 
-import com.google.common.collect.Lists;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.Files;
 import io.netty.buffer.ByteBuf;
@@ -42,8 +45,6 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import org.junit.Test;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
 
 import org.apache.spark.network.TestUtils;
 import org.apache.spark.network.TransportContext;
@@ -53,14 +54,13 @@ import org.apache.spark.network.client.ChunkReceivedCallback;
 import org.apache.spark.network.client.RpcResponseCallback;
 import org.apache.spark.network.client.TransportClient;
 import org.apache.spark.network.client.TransportClientBootstrap;
-import org.apache.spark.network.sasl.aes.AesCipher;
 import org.apache.spark.network.server.RpcHandler;
 import org.apache.spark.network.server.StreamManager;
 import org.apache.spark.network.server.TransportServer;
 import org.apache.spark.network.server.TransportServerBootstrap;
 import org.apache.spark.network.util.ByteArrayWritableChannel;
 import org.apache.spark.network.util.JavaUtils;
-import org.apache.spark.network.util.SystemPropertyConfigProvider;
+import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.TransportConf;
 
 /**
@@ -135,22 +135,19 @@ public class SparkSaslSuite {
     testBasicSasl(true);
   }
 
-  private void testBasicSasl(boolean encrypt) throws Throwable {
+  private static void testBasicSasl(boolean encrypt) throws Throwable {
     RpcHandler rpcHandler = mock(RpcHandler.class);
-    doAnswer(new Answer<Void>() {
-        @Override
-        public Void answer(InvocationOnMock invocation) {
-          ByteBuffer message = (ByteBuffer) invocation.getArguments()[1];
-          RpcResponseCallback cb = (RpcResponseCallback) invocation.getArguments()[2];
-          assertEquals("Ping", JavaUtils.bytesToString(message));
-          cb.onSuccess(JavaUtils.stringToBytes("Pong"));
-          return null;
-        }
-      })
+    doAnswer(invocation -> {
+      ByteBuffer message = (ByteBuffer) invocation.getArguments()[1];
+      RpcResponseCallback cb = (RpcResponseCallback) invocation.getArguments()[2];
+      assertEquals("Ping", JavaUtils.bytesToString(message));
+      cb.onSuccess(JavaUtils.stringToBytes("Pong"));
+      return null;
+    })
       .when(rpcHandler)
       .receive(any(TransportClient.class), any(ByteBuffer.class), any(RpcResponseCallback.class));
 
-    SaslTestCtx ctx = new SaslTestCtx(rpcHandler, encrypt, false, false);
+    SaslTestCtx ctx = new SaslTestCtx(rpcHandler, encrypt, false);
     try {
       ByteBuffer response = ctx.client.sendRpcSync(JavaUtils.stringToBytes("Ping"),
         TimeUnit.SECONDS.toMillis(10));
@@ -194,28 +191,28 @@ public class SparkSaslSuite {
 
       SaslEncryption.EncryptedMessage emsg =
         new SaslEncryption.EncryptedMessage(backend, msg, 1024);
-      long count = emsg.transferTo(channel, emsg.transfered());
+      long count = emsg.transferTo(channel, emsg.transferred());
       assertTrue(count < data.length);
       assertTrue(count > 0);
 
       // Here, the output buffer is full so nothing should be transferred.
-      assertEquals(0, emsg.transferTo(channel, emsg.transfered()));
+      assertEquals(0, emsg.transferTo(channel, emsg.transferred()));
 
       // Now there's room in the buffer, but not enough to transfer all the remaining data,
       // so the dummy count should be returned.
       channel.reset();
-      assertEquals(1, emsg.transferTo(channel, emsg.transfered()));
+      assertEquals(1, emsg.transferTo(channel, emsg.transferred()));
 
       // Eventually, the whole message should be transferred.
       for (int i = 0; i < data.length / 32 - 2; i++) {
         channel.reset();
-        assertEquals(1, emsg.transferTo(channel, emsg.transfered()));
+        assertEquals(1, emsg.transferTo(channel, emsg.transferred()));
       }
 
       channel.reset();
-      count = emsg.transferTo(channel, emsg.transfered());
+      count = emsg.transferTo(channel, emsg.transferred());
       assertTrue("Unexpected count: " + count, count > 1 && count < data.length);
-      assertEquals(data.length, emsg.transfered());
+      assertEquals(data.length, emsg.transferred());
     } finally {
       msg.release();
     }
@@ -225,7 +222,7 @@ public class SparkSaslSuite {
   public void testEncryptedMessageChunking() throws Exception {
     File file = File.createTempFile("sasltest", ".txt");
     try {
-      TransportConf conf = new TransportConf("shuffle", new SystemPropertyConfigProvider());
+      TransportConf conf = new TransportConf("shuffle", MapConfigProvider.EMPTY);
 
       byte[] data = new byte[8 * 1024];
       new Random().nextBytes(data);
@@ -240,9 +237,9 @@ public class SparkSaslSuite {
         new SaslEncryption.EncryptedMessage(backend, msg.convertToNetty(), data.length / 8);
 
       ByteArrayWritableChannel channel = new ByteArrayWritableChannel(data.length);
-      while (emsg.transfered() < emsg.count()) {
+      while (emsg.transferred() < emsg.count()) {
         channel.reset();
-        emsg.transferTo(channel, emsg.transfered());
+        emsg.transferTo(channel, emsg.transferred());
       }
 
       verify(backend, times(8)).wrap(any(byte[].class), anyInt(), anyInt());
@@ -253,21 +250,17 @@ public class SparkSaslSuite {
 
   @Test
   public void testFileRegionEncryption() throws Exception {
-    final String blockSizeConf = "spark.network.sasl.maxEncryptedBlockSize";
-    System.setProperty(blockSizeConf, "1k");
+    Map<String, String> testConf = ImmutableMap.of(
+      "spark.network.sasl.maxEncryptedBlockSize", "1k");
 
-    final AtomicReference<ManagedBuffer> response = new AtomicReference<>();
-    final File file = File.createTempFile("sasltest", ".txt");
+    AtomicReference<ManagedBuffer> response = new AtomicReference<>();
+    File file = File.createTempFile("sasltest", ".txt");
     SaslTestCtx ctx = null;
     try {
-      final TransportConf conf = new TransportConf("shuffle", new SystemPropertyConfigProvider());
+      TransportConf conf = new TransportConf("shuffle", new MapConfigProvider(testConf));
       StreamManager sm = mock(StreamManager.class);
-      when(sm.getChunk(anyLong(), anyInt())).thenAnswer(new Answer<ManagedBuffer>() {
-          @Override
-          public ManagedBuffer answer(InvocationOnMock invocation) {
-            return new FileSegmentManagedBuffer(conf, file, 0, file.length());
-          }
-        });
+      when(sm.getChunk(anyLong(), anyInt())).thenAnswer(invocation ->
+          new FileSegmentManagedBuffer(conf, file, 0, file.length()));
 
       RpcHandler rpcHandler = mock(RpcHandler.class);
       when(rpcHandler.getStreamManager()).thenReturn(sm);
@@ -276,20 +269,17 @@ public class SparkSaslSuite {
       new Random().nextBytes(data);
       Files.write(data, file);
 
-      ctx = new SaslTestCtx(rpcHandler, true, false, false);
+      ctx = new SaslTestCtx(rpcHandler, true, false, testConf);
 
-      final CountDownLatch lock = new CountDownLatch(1);
+      CountDownLatch lock = new CountDownLatch(1);
 
       ChunkReceivedCallback callback = mock(ChunkReceivedCallback.class);
-      doAnswer(new Answer<Void>() {
-          @Override
-          public Void answer(InvocationOnMock invocation) {
-            response.set((ManagedBuffer) invocation.getArguments()[1]);
-            response.get().retain();
-            lock.countDown();
-            return null;
-          }
-        }).when(callback).onSuccess(anyInt(), any(ManagedBuffer.class));
+      doAnswer(invocation -> {
+        response.set((ManagedBuffer) invocation.getArguments()[1]);
+        response.get().retain();
+        lock.countDown();
+        return null;
+      }).when(callback).onSuccess(anyInt(), any(ManagedBuffer.class));
 
       ctx.client.fetchChunk(0, 0, callback);
       lock.await(10, TimeUnit.SECONDS);
@@ -307,18 +297,15 @@ public class SparkSaslSuite {
       if (response.get() != null) {
         response.get().release();
       }
-      System.clearProperty(blockSizeConf);
     }
   }
 
   @Test
   public void testServerAlwaysEncrypt() throws Exception {
-    final String alwaysEncryptConfName = "spark.network.sasl.serverAlwaysEncrypt";
-    System.setProperty(alwaysEncryptConfName, "true");
-
     SaslTestCtx ctx = null;
     try {
-      ctx = new SaslTestCtx(mock(RpcHandler.class), false, false, false);
+      ctx = new SaslTestCtx(mock(RpcHandler.class), false, false,
+        ImmutableMap.of("spark.network.sasl.serverAlwaysEncrypt", "true"));
       fail("Should have failed to connect without encryption.");
     } catch (Exception e) {
       assertTrue(e.getCause() instanceof SaslException);
@@ -326,7 +313,6 @@ public class SparkSaslSuite {
       if (ctx != null) {
         ctx.close();
       }
-      System.clearProperty(alwaysEncryptConfName);
     }
   }
 
@@ -337,7 +323,7 @@ public class SparkSaslSuite {
     // able to understand RPCs sent to it and thus close the connection.
     SaslTestCtx ctx = null;
     try {
-      ctx = new SaslTestCtx(mock(RpcHandler.class), true, true, false);
+      ctx = new SaslTestCtx(mock(RpcHandler.class), true, true);
       ctx.client.sendRpcSync(JavaUtils.stringToBytes("Ping"),
         TimeUnit.SECONDS.toMillis(10));
       fail("Should have failed to send RPC to server.");
@@ -361,80 +347,18 @@ public class SparkSaslSuite {
     verify(handler).getStreamManager();
 
     saslHandler.channelInactive(null);
-    verify(handler).channelInactive(any(TransportClient.class));
+    verify(handler).channelInactive(isNull());
 
     saslHandler.exceptionCaught(null, null);
-    verify(handler).exceptionCaught(any(Throwable.class), any(TransportClient.class));
+    verify(handler).exceptionCaught(isNull(), isNull());
   }
 
   @Test
   public void testDelegates() throws Exception {
     Method[] rpcHandlerMethods = RpcHandler.class.getDeclaredMethods();
     for (Method m : rpcHandlerMethods) {
-      SaslRpcHandler.class.getDeclaredMethod(m.getName(), m.getParameterTypes());
-    }
-  }
-
-  @Test
-  public void testAesEncryption() throws Exception {
-    final AtomicReference<ManagedBuffer> response = new AtomicReference<>();
-    final File file = File.createTempFile("sasltest", ".txt");
-    SaslTestCtx ctx = null;
-    try {
-      final TransportConf conf = new TransportConf("rpc", new SystemPropertyConfigProvider());
-      final TransportConf spyConf = spy(conf);
-      doReturn(true).when(spyConf).aesEncryptionEnabled();
-
-      StreamManager sm = mock(StreamManager.class);
-      when(sm.getChunk(anyLong(), anyInt())).thenAnswer(new Answer<ManagedBuffer>() {
-        @Override
-        public ManagedBuffer answer(InvocationOnMock invocation) {
-          return new FileSegmentManagedBuffer(spyConf, file, 0, file.length());
-        }
-      });
-
-      RpcHandler rpcHandler = mock(RpcHandler.class);
-      when(rpcHandler.getStreamManager()).thenReturn(sm);
-
-      byte[] data = new byte[256 * 1024 * 1024];
-      new Random().nextBytes(data);
-      Files.write(data, file);
-
-      ctx = new SaslTestCtx(rpcHandler, true, false, true);
-
-      final Object lock = new Object();
-
-      ChunkReceivedCallback callback = mock(ChunkReceivedCallback.class);
-      doAnswer(new Answer<Void>() {
-        @Override
-        public Void answer(InvocationOnMock invocation) {
-          response.set((ManagedBuffer) invocation.getArguments()[1]);
-          response.get().retain();
-          synchronized (lock) {
-            lock.notifyAll();
-          }
-          return null;
-        }
-      }).when(callback).onSuccess(anyInt(), any(ManagedBuffer.class));
-
-      synchronized (lock) {
-        ctx.client.fetchChunk(0, 0, callback);
-        lock.wait(10 * 1000);
-      }
-
-      verify(callback, times(1)).onSuccess(anyInt(), any(ManagedBuffer.class));
-      verify(callback, never()).onFailure(anyInt(), any(Throwable.class));
-
-      byte[] received = ByteStreams.toByteArray(response.get().createInputStream());
-      assertTrue(Arrays.equals(data, received));
-    } finally {
-      file.delete();
-      if (ctx != null) {
-        ctx.close();
-      }
-      if (response.get() != null) {
-        response.get().release();
-      }
+      Method delegate = SaslRpcHandler.class.getMethod(m.getName(), m.getParameterTypes());
+      assertNotEquals(delegate.getDeclaringClass(), RpcHandler.class);
     }
   }
 
@@ -442,6 +366,7 @@ public class SparkSaslSuite {
 
     final TransportClient client;
     final TransportServer server;
+    final TransportContext ctx;
 
     private final boolean encrypt;
     private final boolean disableClientEncryption;
@@ -450,34 +375,39 @@ public class SparkSaslSuite {
     SaslTestCtx(
         RpcHandler rpcHandler,
         boolean encrypt,
-        boolean disableClientEncryption,
-        boolean aesEnable)
+        boolean disableClientEncryption)
       throws Exception {
 
-      TransportConf conf = new TransportConf("shuffle", new SystemPropertyConfigProvider());
+      this(rpcHandler, encrypt, disableClientEncryption, Collections.emptyMap());
+    }
 
-      if (aesEnable) {
-        conf = spy(conf);
-        doReturn(true).when(conf).aesEncryptionEnabled();
-      }
+    SaslTestCtx(
+        RpcHandler rpcHandler,
+        boolean encrypt,
+        boolean disableClientEncryption,
+        Map<String, String> extraConf)
+      throws Exception {
+
+      Map<String, String> testConf = ImmutableMap.<String, String>builder()
+        .putAll(extraConf)
+        .put("spark.authenticate.enableSaslEncryption", String.valueOf(encrypt))
+        .build();
+      TransportConf conf = new TransportConf("shuffle", new MapConfigProvider(testConf));
 
       SecretKeyHolder keyHolder = mock(SecretKeyHolder.class);
       when(keyHolder.getSaslUser(anyString())).thenReturn("user");
       when(keyHolder.getSecretKey(anyString())).thenReturn("secret");
 
-      TransportContext ctx = new TransportContext(conf, rpcHandler);
+      this.ctx = new TransportContext(conf, rpcHandler);
 
-      String encryptHandlerName = aesEnable ? AesCipher.ENCRYPTION_HANDLER_NAME :
-        SaslEncryption.ENCRYPTION_HANDLER_NAME;
-
-      this.checker = new EncryptionCheckerBootstrap(encryptHandlerName);
+      this.checker = new EncryptionCheckerBootstrap(SaslEncryption.ENCRYPTION_HANDLER_NAME);
 
       this.server = ctx.createServer(Arrays.asList(new SaslServerBootstrap(conf, keyHolder),
         checker));
 
       try {
-        List<TransportClientBootstrap> clientBootstraps = Lists.newArrayList();
-        clientBootstraps.add(new SaslClientBootstrap(conf, "user", keyHolder, encrypt));
+        List<TransportClientBootstrap> clientBootstraps = new ArrayList<>();
+        clientBootstraps.add(new SaslClientBootstrap(conf, "user", keyHolder));
         if (disableClientEncryption) {
           clientBootstraps.add(new EncryptionDisablerBootstrap());
         }
@@ -503,6 +433,9 @@ public class SparkSaslSuite {
       if (server != null) {
         server.close();
       }
+      if (ctx != null) {
+        ctx.close();
+      }
     }
 
   }
@@ -525,11 +458,6 @@ public class SparkSaslSuite {
           ctx.channel().pipeline().get(encryptHandlerName) != null;
       }
       ctx.write(msg, promise);
-    }
-
-    @Override
-    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
-      super.handlerRemoved(ctx);
     }
 
     @Override

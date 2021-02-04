@@ -21,14 +21,15 @@ import java.nio.charset.StandardCharsets
 
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.functions.{log => logarithm}
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
 
 private object MathFunctionsTestData {
   case class DoubleData(a: java.lang.Double, b: java.lang.Double)
   case class NullDoubles(a: java.lang.Double)
 }
 
-class MathFunctionsSuite extends QueryTest with SharedSQLContext {
+class MathFunctionsSuite extends QueryTest with SharedSparkSession {
   import MathFunctionsTestData._
   import testImplicits._
 
@@ -67,7 +68,7 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
       (1 to 10).map(n => Row(f(n * 0.1)))
     )
 
-    if (f(-1) === math.log1p(-1)) {
+    if (f(-1) === StrictMath.log1p(-1)) {
       checkAnswer(
         nnDoubleData.select(c('b)),
         (1 to 9).map(n => Row(f(n * -0.1))) :+ Row(null)
@@ -124,6 +125,11 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
     testOneToOneMathFunction(sinh, math.sinh)
   }
 
+  test("asinh") {
+    testOneToOneMathFunction(asinh,
+      (x: Double) => math.log(x + math.sqrt(x * x + 1)) )
+  }
+
   test("cos") {
     testOneToOneMathFunction(cos, math.cos)
   }
@@ -136,6 +142,11 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
     testOneToOneMathFunction(cosh, math.cosh)
   }
 
+  test("acosh") {
+    testOneToOneMathFunction(acosh,
+      (x: Double) => math.log(x + math.sqrt(x * x - 1)) )
+  }
+
   test("tan") {
     testOneToOneMathFunction(tan, math.tan)
   }
@@ -146,6 +157,11 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
 
   test("tanh") {
     testOneToOneMathFunction(tanh, math.tanh)
+  }
+
+  test("atanh") {
+    testOneToOneMathFunction(atanh,
+      (x: Double) => (0.5 * (math.log1p(x) - math.log1p(-x))) )
   }
 
   test("degrees") {
@@ -184,7 +200,7 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
     checkAnswer(df.selectExpr("""conv("100", 2, 10)"""), Row("4"))
     checkAnswer(df.selectExpr("""conv("-10", 16, -10)"""), Row("-16"))
     checkAnswer(
-      df.selectExpr("""conv("9223372036854775807", 36, -16)"""), Row("-1")) // for overflow
+      df.selectExpr("""conv("9223372036854775807", 36, -16)"""), Row("12DDAC15F246BAF8C0D551AC7"))
   }
 
   test("floor") {
@@ -218,27 +234,66 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
       Seq(Row(5, 0, 0), Row(55, 60, 100), Row(555, 560, 600))
     )
 
-    val pi = "3.1415"
+    withSQLConf(SQLConf.LEGACY_ALLOW_NEGATIVE_SCALE_OF_DECIMAL_ENABLED.key -> "true") {
+      val pi = "3.1415"
+      checkAnswer(
+        sql(s"SELECT round($pi, -3), round($pi, -2), round($pi, -1), " +
+          s"round($pi, 0), round($pi, 1), round($pi, 2), round($pi, 3)"),
+        Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
+          BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      )
+      checkAnswer(
+        sql(s"SELECT bround($pi, -3), bround($pi, -2), bround($pi, -1), " +
+          s"bround($pi, 0), bround($pi, 1), bround($pi, 2), bround($pi, 3)"),
+        Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
+          BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      )
+    }
+
+    val bdPi: BigDecimal = BigDecimal(31415925L, 7)
     checkAnswer(
-      sql(s"SELECT round($pi, -3), round($pi, -2), round($pi, -1), " +
-        s"round($pi, 0), round($pi, 1), round($pi, 2), round($pi, 3)"),
-      Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
-        BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      sql(s"SELECT round($bdPi, 7), round($bdPi, 8), round($bdPi, 9), round($bdPi, 10), " +
+        s"round($bdPi, 100), round($bdPi, 6), round(null, 8)"),
+      Seq(Row(bdPi, bdPi, bdPi, bdPi, bdPi, BigDecimal("3.141593"), null))
+    )
+
+    checkAnswer(
+      sql(s"SELECT bround($bdPi, 7), bround($bdPi, 8), bround($bdPi, 9), bround($bdPi, 10), " +
+        s"bround($bdPi, 100), bround($bdPi, 6), bround(null, 8)"),
+      Seq(Row(bdPi, bdPi, bdPi, bdPi, bdPi, BigDecimal("3.141592"), null))
+    )
+  }
+
+  test("round/bround with data frame from a local Seq of Product") {
+    val df = spark.createDataFrame(Seq(Tuple1(BigDecimal("5.9")))).toDF("value")
+    checkAnswer(
+      df.withColumn("value_rounded", round('value)),
+      Seq(Row(BigDecimal("5.9"), BigDecimal("6")))
     )
     checkAnswer(
-      sql(s"SELECT bround($pi, -3), bround($pi, -2), bround($pi, -1), " +
-        s"bround($pi, 0), bround($pi, 1), bround($pi, 2), bround($pi, 3)"),
-      Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
-        BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      df.withColumn("value_brounded", bround('value)),
+      Seq(Row(BigDecimal("5.9"), BigDecimal("6")))
     )
+  }
+
+  test("round/bround with table columns") {
+    withTable("t") {
+      Seq(BigDecimal("5.9")).toDF("i").write.saveAsTable("t")
+      checkAnswer(
+        sql("select i, round(i) from t"),
+        Seq(Row(BigDecimal("5.9"), BigDecimal("6"))))
+      checkAnswer(
+        sql("select i, bround(i) from t"),
+        Seq(Row(BigDecimal("5.9"), BigDecimal("6"))))
+    }
   }
 
   test("exp") {
-    testOneToOneMathFunction(exp, math.exp)
+    testOneToOneMathFunction(exp, StrictMath.exp)
   }
 
   test("expm1") {
-    testOneToOneMathFunction(expm1, math.expm1)
+    testOneToOneMathFunction(expm1, StrictMath.expm1)
   }
 
   test("signum / sign") {
@@ -250,7 +305,7 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
   }
 
   test("pow / power") {
-    testTwoToOneMathFunction(pow, pow, math.pow)
+    testTwoToOneMathFunction(pow, pow, StrictMath.pow)
 
     checkAnswer(
       sql("SELECT pow(1, 2), power(2, 1)"),
@@ -290,7 +345,7 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
   }
 
   test("log / ln") {
-    testOneToOneNonNegativeMathFunction(org.apache.spark.sql.functions.log, math.log)
+    testOneToOneNonNegativeMathFunction(org.apache.spark.sql.functions.log, StrictMath.log)
     checkAnswer(
       sql("SELECT ln(0), ln(1), ln(1.5)"),
       Seq((1, 2)).toDF().select(logarithm(lit(0)), logarithm(lit(1)), logarithm(lit(1.5)))
@@ -298,11 +353,11 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
   }
 
   test("log10") {
-    testOneToOneNonNegativeMathFunction(log10, math.log10)
+    testOneToOneNonNegativeMathFunction(log10, StrictMath.log10)
   }
 
   test("log1p") {
-    testOneToOneNonNegativeMathFunction(log1p, math.log1p)
+    testOneToOneNonNegativeMathFunction(log1p, StrictMath.log1p)
   }
 
   test("shift left") {
@@ -311,14 +366,14 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
 
     checkAnswer(
       df.select(
-        shiftLeft('a, 1), shiftLeft('b, 1), shiftLeft('c, 1), shiftLeft('d, 1),
-        shiftLeft('f, 1)),
+        shiftleft('a, 1), shiftleft('b, 1), shiftleft('c, 1), shiftleft('d, 1),
+        shiftLeft('f, 1)), // test deprecated one.
         Row(42.toLong, 42, 42.toShort, 42.toByte, null))
 
     checkAnswer(
       df.selectExpr(
-        "shiftLeft(a, 1)", "shiftLeft(b, 1)", "shiftLeft(b, 1)", "shiftLeft(d, 1)",
-        "shiftLeft(f, 1)"),
+        "shiftleft(a, 1)", "shiftleft(b, 1)", "shiftleft(b, 1)", "shiftleft(d, 1)",
+        "shiftleft(f, 1)"),
       Row(42.toLong, 42, 42.toShort, 42.toByte, null))
   }
 
@@ -328,14 +383,14 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
 
     checkAnswer(
       df.select(
-        shiftRight('a, 1), shiftRight('b, 1), shiftRight('c, 1), shiftRight('d, 1),
-        shiftRight('f, 1)),
+        shiftright('a, 1), shiftright('b, 1), shiftright('c, 1), shiftright('d, 1),
+        shiftRight('f, 1)), // test deprecated one.
       Row(21.toLong, 21, 21.toShort, 21.toByte, null))
 
     checkAnswer(
       df.selectExpr(
-        "shiftRight(a, 1)", "shiftRight(b, 1)", "shiftRight(c, 1)", "shiftRight(d, 1)",
-        "shiftRight(f, 1)"),
+        "shiftright(a, 1)", "shiftright(b, 1)", "shiftright(c, 1)", "shiftright(d, 1)",
+        "shiftright(f, 1)"),
       Row(21.toLong, 21, 21.toShort, 21.toByte, null))
   }
 
@@ -345,14 +400,14 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
 
     checkAnswer(
       df.select(
-        shiftRightUnsigned('a, 1), shiftRightUnsigned('b, 1), shiftRightUnsigned('c, 1),
-        shiftRightUnsigned('d, 1), shiftRightUnsigned('f, 1)),
+        shiftrightunsigned('a, 1), shiftrightunsigned('b, 1), shiftrightunsigned('c, 1),
+        shiftrightunsigned('d, 1), shiftRightUnsigned('f, 1)), // test deprecated one.
       Row(9223372036854775787L, 21, 21.toShort, 21.toByte, null))
 
     checkAnswer(
       df.selectExpr(
-        "shiftRightUnsigned(a, 1)", "shiftRightUnsigned(b, 1)", "shiftRightUnsigned(c, 1)",
-        "shiftRightUnsigned(d, 1)", "shiftRightUnsigned(f, 1)"),
+        "shiftrightunsigned(a, 1)", "shiftrightunsigned(b, 1)", "shiftrightunsigned(c, 1)",
+        "shiftrightunsigned(d, 1)", "shiftrightunsigned(f, 1)"),
       Row(9223372036854775787L, 21, 21.toShort, 21.toByte, null))
   }
 
@@ -362,11 +417,11 @@ class MathFunctionsSuite extends QueryTest with SharedSQLContext {
       df.select(org.apache.spark.sql.functions.log("a"),
         org.apache.spark.sql.functions.log(2.0, "a"),
         org.apache.spark.sql.functions.log("b")),
-      Row(math.log(123), math.log(123) / math.log(2), null))
+      Row(StrictMath.log(123), StrictMath.log(123) / StrictMath.log(2), null))
 
     checkAnswer(
       df.selectExpr("log(a)", "log(2.0, a)", "log(b)"),
-      Row(math.log(123), math.log(123) / math.log(2), null))
+      Row(StrictMath.log(123), StrictMath.log(123) / StrictMath.log(2), null))
   }
 
   test("abs") {

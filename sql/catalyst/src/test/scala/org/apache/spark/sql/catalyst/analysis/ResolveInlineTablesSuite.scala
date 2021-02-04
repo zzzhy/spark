@@ -20,17 +20,17 @@ package org.apache.spark.sql.catalyst.analysis
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.{Literal, Rand}
+import org.apache.spark.sql.catalyst.expressions.{Cast, Literal, Rand}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Count
-import org.apache.spark.sql.catalyst.plans.PlanTest
-import org.apache.spark.sql.types.{LongType, NullType}
+import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
+import org.apache.spark.sql.types.{LongType, NullType, TimestampType}
 
 /**
  * Unit tests for [[ResolveInlineTables]]. Note that there are also test cases defined in
  * end-to-end tests (in sql/core module) for verifying the correct error messages are shown
  * in negative cases.
  */
-class ResolveInlineTablesSuite extends PlanTest with BeforeAndAfter {
+class ResolveInlineTablesSuite extends AnalysisTest with BeforeAndAfter {
 
   private def lit(v: Any): Literal = Literal(v)
 
@@ -87,6 +87,18 @@ class ResolveInlineTablesSuite extends PlanTest with BeforeAndAfter {
     assert(converted.data.size == 2)
     assert(converted.data(0).getLong(0) == 1L)
     assert(converted.data(1).getLong(0) == 2L)
+  }
+
+  test("convert TimeZoneAwareExpression") {
+    val table = UnresolvedInlineTable(Seq("c1"),
+      Seq(Seq(Cast(lit("1991-12-06 00:00:00.0"), TimestampType))))
+    val withTimeZone = ResolveTimeZone.apply(table)
+    val LocalRelation(output, data, _) = ResolveInlineTables.apply(withTimeZone)
+    val correct = Cast(lit("1991-12-06 00:00:00.0"), TimestampType)
+      .withTimeZone(conf.sessionLocalTimeZone).eval().asInstanceOf[Long]
+    assert(output.map(_.dataType) == Seq(TimestampType))
+    assert(data.size == 1)
+    assert(data.head.getLong(0) == correct)
   }
 
   test("nullability inference in convert") {

@@ -75,15 +75,15 @@ class NaiveBayesModel private[spark] (
   private val (thetaMinusNegTheta, negThetaSum) = modelType match {
     case Multinomial => (None, None)
     case Bernoulli =>
-      val negTheta = thetaMatrix.map(value => math.log(1.0 - math.exp(value)))
-      val ones = new DenseVector(Array.fill(thetaMatrix.numCols) {1.0})
+      val negTheta = thetaMatrix.map(value => math.log1p(-math.exp(value)))
+      val ones = new DenseVector(Array.fill(thetaMatrix.numCols)(1.0))
       val thetaMinusNegTheta = thetaMatrix.map { value =>
-        value - math.log(1.0 - math.exp(value))
+        value - math.log1p(-math.exp(value))
       }
       (Option(thetaMinusNegTheta), Option(negTheta.multiply(ones)))
     case _ =>
       // This should never happen.
-      throw new UnknownError(s"Invalid modelType: $modelType.")
+      throw new IllegalArgumentException(s"Invalid modelType: $modelType.")
   }
 
   @Since("1.0.0")
@@ -145,8 +145,8 @@ class NaiveBayesModel private[spark] (
   }
 
   private def bernoulliCalculation(testData: Vector) = {
-    testData.foreachActive((_, value) =>
-      if (value != 0.0 && value != 1.0) {
+    testData.foreachNonZero((_, value) =>
+      if (value != 1.0) {
         throw new SparkException(
           s"Bernoulli naive Bayes requires 0 or 1 feature values but found $testData.")
       }
@@ -170,8 +170,6 @@ class NaiveBayesModel private[spark] (
     val data = NaiveBayesModel.SaveLoadV2_0.Data(labels, pi, theta, modelType)
     NaiveBayesModel.SaveLoadV2_0.save(sc, path, data)
   }
-
-  override protected def formatVersion: String = "2.0"
 }
 
 @Since("1.3.0")
@@ -218,7 +216,7 @@ object NaiveBayesModel extends Loader[NaiveBayesModel] {
       val data = dataArray(0)
       val labels = data.getAs[Seq[Double]](0).toArray
       val pi = data.getAs[Seq[Double]](1).toArray
-      val theta = data.getAs[Seq[Seq[Double]]](2).map(_.toArray).toArray
+      val theta = data.getSeq[scala.collection.Seq[Double]](2).map(_.toArray).toArray
       val modelType = data.getString(3)
       new NaiveBayesModel(labels, pi, theta, modelType)
     }
@@ -262,7 +260,7 @@ object NaiveBayesModel extends Loader[NaiveBayesModel] {
       val data = dataArray(0)
       val labels = data.getAs[Seq[Double]](0).toArray
       val pi = data.getAs[Seq[Double]](1).toArray
-      val theta = data.getAs[Seq[Seq[Double]]](2).map(_.toArray).toArray
+      val theta = data.getSeq[scala.collection.Seq[Double]](2).map(_.toArray).toArray
       new NaiveBayesModel(labels, pi, theta)
     }
   }
@@ -302,10 +300,11 @@ object NaiveBayesModel extends Loader[NaiveBayesModel] {
 /**
  * Trains a Naive Bayes model given an RDD of `(label, features)` pairs.
  *
- * This is the Multinomial NB ([[http://tinyurl.com/lsdw6p]]) which can handle all kinds of
- * discrete data.  For example, by converting documents into TF-IDF vectors, it can be used for
- * document classification.  By making every vector a 0-1 vector, it can also be used as
- * Bernoulli NB ([[http://tinyurl.com/p7c96j6]]). The input feature values must be nonnegative.
+ * This is the Multinomial NB (see <a href="http://tinyurl.com/lsdw6p">here</a>) which can
+ * handle all kinds of discrete data. For example, by converting documents into TF-IDF
+ * vectors, it can be used for document classification. By making every vector a 0-1 vector,
+ * it can also be used as Bernoulli NB (see <a href="http://tinyurl.com/p7c96j6">here</a>).
+ * The input feature values must be nonnegative.
  */
 @Since("0.9.0")
 class NaiveBayes private (
@@ -372,7 +371,7 @@ class NaiveBayes private (
     val newModel = nb.trainWithLabelCheck(dataset, positiveLabel = false)
 
     val pi = newModel.pi.toArray
-    val theta = Array.fill[Double](newModel.numClasses, newModel.numFeatures)(0.0)
+    val theta = Array.ofDim[Double](newModel.numClasses, newModel.numFeatures)
     newModel.theta.foreachActive {
       case (i, j, v) =>
         theta(i)(j) = v
@@ -391,20 +390,20 @@ class NaiveBayes private (
 object NaiveBayes {
 
   /** String name for multinomial model type. */
-  private[spark] val Multinomial: String = "multinomial"
+  private[classification] val Multinomial: String = "multinomial"
 
   /** String name for Bernoulli model type. */
-  private[spark] val Bernoulli: String = "bernoulli"
+  private[classification] val Bernoulli: String = "bernoulli"
 
   /* Set of modelTypes that NaiveBayes supports */
-  private[spark] val supportedModelTypes = Set(Multinomial, Bernoulli)
+  private[classification] val supportedModelTypes = Set(Multinomial, Bernoulli)
 
   /**
    * Trains a Naive Bayes model given an RDD of `(label, features)` pairs.
    *
-   * This is the default Multinomial NB ([[http://tinyurl.com/lsdw6p]]) which can handle all
-   * kinds of discrete data.  For example, by converting documents into TF-IDF vectors, it
-   * can be used for document classification.
+   * This is the default Multinomial NB (see <a href="http://tinyurl.com/lsdw6p">here</a>)
+   * which can handle all kinds of discrete data. For example, by converting documents into
+   * TF-IDF vectors, it can be used for document classification.
    *
    * This version of the method uses a default smoothing parameter of 1.0.
    *
@@ -419,9 +418,9 @@ object NaiveBayes {
   /**
    * Trains a Naive Bayes model given an RDD of `(label, features)` pairs.
    *
-   * This is the default Multinomial NB ([[http://tinyurl.com/lsdw6p]]) which can handle all
-   * kinds of discrete data.  For example, by converting documents into TF-IDF vectors, it
-   * can be used for document classification.
+   * This is the default Multinomial NB (see <a href="http://tinyurl.com/lsdw6p">here</a>)
+   * which can handle all kinds of discrete data. For example, by converting documents
+   * into TF-IDF vectors, it can be used for document classification.
    *
    * @param input RDD of `(label, array of features)` pairs.  Every vector should be a frequency
    *              vector or a count vector.
@@ -435,9 +434,10 @@ object NaiveBayes {
   /**
    * Trains a Naive Bayes model given an RDD of `(label, features)` pairs.
    *
-   * The model type can be set to either Multinomial NB ([[http://tinyurl.com/lsdw6p]])
-   * or Bernoulli NB ([[http://tinyurl.com/p7c96j6]]). The Multinomial NB can handle
-   * discrete count data and can be called by setting the model type to "multinomial".
+   * The model type can be set to either Multinomial NB (see <a href="http://tinyurl.com/lsdw6p">
+   * here</a>) or Bernoulli NB (see <a href="http://tinyurl.com/p7c96j6">here</a>).
+   * The Multinomial NB can handle discrete count data and can be called by setting the model
+   * type to "multinomial".
    * For example, it can be used with word counts or TF_IDF vectors of documents.
    * The Bernoulli model fits presence or absence (0-1) counts. By making every vector a
    * 0-1 vector and setting the model type to "bernoulli", the  fits and predicts as

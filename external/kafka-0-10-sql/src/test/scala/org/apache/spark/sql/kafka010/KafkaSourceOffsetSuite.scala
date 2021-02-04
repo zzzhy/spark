@@ -21,9 +21,10 @@ import java.io.File
 
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.streaming.OffsetSuite
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.Utils
 
-class KafkaSourceOffsetSuite extends OffsetSuite with SharedSQLContext {
+class KafkaSourceOffsetSuite extends OffsetSuite with SharedSparkSession {
 
   compare(
     one = KafkaSourceOffset(("t", 0, 1L)),
@@ -55,7 +56,7 @@ class KafkaSourceOffsetSuite extends OffsetSuite with SharedSQLContext {
   }
 
 
-  testWithUninterruptibleThread("OffsetSeqLog serialization - deserialization") {
+  test("OffsetSeqLog serialization - deserialization") {
     withTempDir { temp =>
       // use non-existent directory to test whether log make the dir
       val dir = new File(temp, "dir")
@@ -88,5 +89,17 @@ class KafkaSourceOffsetSuite extends OffsetSuite with SharedSQLContext {
       assert(metadataLog.get(None, Some(1)) ===
         Array(0 -> batch0Serialized, 1 -> batch1Serialized))
     }
+  }
+
+  test("read Spark 2.1.0 offset format") {
+    val offset = readFromResource("kafka-source-offset-version-2.1.0.txt")
+    assert(KafkaSourceOffset(offset) ===
+      KafkaSourceOffset(("topic1", 0, 456L), ("topic1", 1, 789L), ("topic2", 0, 0L)))
+  }
+
+  private def readFromResource(file: String): SerializedOffset = {
+    import scala.io.Source
+    val input = getClass.getResource(s"/$file").toURI
+    SerializedOffset(Utils.tryWithResource(Source.fromFile(input))(_.mkString))
   }
 }

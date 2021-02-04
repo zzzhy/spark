@@ -17,35 +17,65 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import scala.math.max
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.util.DateTimeUtils.microsToMillis
+import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.types.MetadataBuilder
 import org.apache.spark.unsafe.types.CalendarInterval
 import org.apache.spark.util.AccumulatorV2
 
-/** Tracks the maximum positive long seen. */
-class MaxLong(protected var currentValue: Long = 0)
-  extends AccumulatorV2[Long, Long] {
+/** Class for collecting event time stats with an accumulator */
+case class EventTimeStats(var max: Long, var min: Long, var avg: Double, var count: Long) {
+  def add(eventTime: Long): Unit = {
+    this.max = math.max(this.max, eventTime)
+    this.min = math.min(this.min, eventTime)
+    this.count += 1
+    this.avg += (eventTime - avg) / count
+  }
 
-  override def isZero: Boolean = value == 0
-  override def value: Long = currentValue
-  override def copy(): AccumulatorV2[Long, Long] = new MaxLong(currentValue)
+  def merge(that: EventTimeStats): Unit = {
+    if (that.count == 0) {
+      // no-op
+    } else if (this.count == 0) {
+      this.max = that.max
+      this.min = that.min
+      this.count = that.count
+      this.avg = that.avg
+    } else {
+      this.max = math.max(this.max, that.max)
+      this.min = math.min(this.min, that.min)
+      this.count += that.count
+      this.avg += (that.avg - this.avg) * that.count / this.count
+    }
+  }
+}
+
+object EventTimeStats {
+  def zero: EventTimeStats = EventTimeStats(
+    max = Long.MinValue, min = Long.MaxValue, avg = 0.0, count = 0L)
+}
+
+/** Accumulator that collects stats on event time in a batch. */
+class EventTimeStatsAccum(protected var currentStats: EventTimeStats = EventTimeStats.zero)
+  extends AccumulatorV2[Long, EventTimeStats] {
+
+  override def isZero: Boolean = value == EventTimeStats.zero
+  override def value: EventTimeStats = currentStats
+  override def copy(): AccumulatorV2[Long, EventTimeStats] = new EventTimeStatsAccum(currentStats)
 
   override def reset(): Unit = {
-    currentValue = 0
+    currentStats = EventTimeStats.zero
   }
 
   override def add(v: Long): Unit = {
-    currentValue = max(v, value)
+    currentStats.add(v)
   }
 
-  override def merge(other: AccumulatorV2[Long, Long]): Unit = {
-    currentValue = max(value, other.value)
+  override def merge(other: AccumulatorV2[Long, EventTimeStats]): Unit = {
+    currentStats.merge(other.value)
   }
 }
 
@@ -54,22 +84,23 @@ class MaxLong(protected var currentValue: Long = 0)
  * adding appropriate metadata to this column, this operator also tracks the maximum observed event
  * time. Based on the maximum observed time and a user specified delay, we can calculate the
  * `watermark` after which we assume we will no longer see late records for a particular time
- * period.
+ * period. Note that event time is measured in milliseconds.
  */
 case class EventTimeWatermarkExec(
     eventTime: Attribute,
     delay: CalendarInterval,
-    child: SparkPlan) extends SparkPlan {
+    child: SparkPlan) extends UnaryExecNode {
 
-  // TODO: Use Spark SQL Metrics?
-  val maxEventTime = new MaxLong
-  sparkContext.register(maxEventTime)
+  val eventTimeStats = new EventTimeStatsAccum()
+  val delayMs = EventTimeWatermark.getDelayMs(delay)
+
+  sparkContext.register(eventTimeStats)
 
   override protected def doExecute(): RDD[InternalRow] = {
     child.execute().mapPartitions { iter =>
       val getEventTime = UnsafeProjection.create(eventTime :: Nil, child.output)
       iter.map { row =>
-        maxEventTime.add(getEventTime(row).getLong(0))
+        eventTimeStats.add(microsToMillis(getEventTime(row).getLong(0)))
         row
       }
     }
@@ -79,15 +110,19 @@ case class EventTimeWatermarkExec(
   override val output: Seq[Attribute] = child.output.map { a =>
     if (a semanticEquals eventTime) {
       val updatedMetadata = new MetadataBuilder()
-          .withMetadata(a.metadata)
-          .putLong(EventTimeWatermark.delayKey, delay.milliseconds)
-          .build()
-
+        .withMetadata(a.metadata)
+        .putLong(EventTimeWatermark.delayKey, delayMs)
+        .build()
+      a.withMetadata(updatedMetadata)
+    } else if (a.metadata.contains(EventTimeWatermark.delayKey)) {
+      // Remove existing watermark
+      val updatedMetadata = new MetadataBuilder()
+        .withMetadata(a.metadata)
+        .remove(EventTimeWatermark.delayKey)
+        .build()
       a.withMetadata(updatedMetadata)
     } else {
       a
     }
   }
-
-  override def children: Seq[SparkPlan] = child :: Nil
 }

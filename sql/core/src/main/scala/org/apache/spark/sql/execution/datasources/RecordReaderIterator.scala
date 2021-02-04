@@ -21,8 +21,6 @@ import java.io.Closeable
 
 import org.apache.hadoop.mapreduce.RecordReader
 
-import org.apache.spark.sql.catalyst.InternalRow
-
 /**
  * An adaptor from a Hadoop [[RecordReader]] to an [[Iterator]] over the values returned.
  *
@@ -59,10 +57,6 @@ class RecordReaderIterator[T](
   override def close(): Unit = {
     if (rowReader != null) {
       try {
-        // Close the reader and release it. Note: it's very important that we don't close the
-        // reader more than once, since that exposes us to MAPREDUCE-5918 when running against
-        // older Hadoop 2.x releases. That bug can lead to non-deterministic corruption issues
-        // when reading compressed input.
         rowReader.close()
       } finally {
         rowReader = null
